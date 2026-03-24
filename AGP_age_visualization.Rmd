@@ -1,0 +1,1063 @@
+---
+title: "AGP Age Visualization"
+output: 
+  html_document:    
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(stringr)
+library(dplyr)
+library(Matrix)
+library(tidyverse)
+library(trac)
+library(phyloseq)
+library(gridExtra)
+library(ggtree)
+```
+
+
+```{r}
+data <- readRDS("D:/KUSS/School/Biostat seminar/AGP_BMI_cat/data/AGP_10.RDS")
+data_subset <- data.frame(data@sam_data)  
+```
+
+
+Extract a host related variables with subjects not having diabetes or have taken antibiotics the last year.
+
+
+```{r}
+levels_str <- c("Never", 
+                "Rarely (a few times/month)",
+                "Occasionally (1-2 times/week)",
+                "Regularly (3-5 times/week)",
+                "Daily")
+level_str_food <- c("Never", 
+                "Rarely (less than once/week)",
+                "Occasionally (1-2 times/week)",
+                "Regularly (3-5 times/week)",
+                "Daily")
+levels_sleep <- c("Less than 5 hours", 
+                 "5-6 hours",
+                 "6-7 hours",
+                 "7-8 hours",
+                 "8 or more hours")
+levels_bmi <- c("Underweight",
+                "Normal",
+                "Overweight",
+                "Obese")
+
+relevant_features_1 <- data_subset %>%
+  select(bmi_cat,
+         alcohol_consumption,
+         exercise_frequency,
+         sleep_duration,
+         fruit_frequency,
+         vegetable_frequency,
+         age_years,
+         sex,
+         antibiotic_history,
+         diabetes,
+         non_food_allergies_unspecified,
+         allergic_to_i_have_no_food_allergies_that_i_know_of,
+         dog,
+         flossing_frequency,
+         frozen_dessert_frequency,
+         last_travel,
+         last_move,
+         milk_substitute_frequency,
+         nail_biter,
+         meat_eggs_frequency,
+         olive_oil,
+         one_liter_of_water_a_day_frequency,
+         prepared_meals_frequency,
+         probiotic_frequency,
+         red_meat_frequency,
+         seafood_frequency,
+         smoking_frequency,
+         sugar_sweetened_drink_frequency,
+         sugary_sweets_frequency,
+         teethbrushing_frequency,
+         vitamin_b_supplement_frequency,
+         vitamin_d_supplement_frequency,
+         whole_eggs,
+         whole_grain_frequency) %>%
+  mutate(across(.cols = everything(), as.character)) %>%
+  filter(antibiotic_history == "I have not taken antibiotics in the past year.") %>%
+  filter(diabetes == "I do not have this condition") %>%
+  select(-antibiotic_history, -diabetes) %>%
+  mutate(across(where(is.character), ~ str_replace_all(., "Unspecified", replacement = ""))) %>%
+  mutate(across(where(is.character), ~ str_replace_all(., "unknown", replacement = ""))) %>%
+  mutate(across(where(is.character), ~ str_replace_all(., "yes", replacement = "true"))) %>%
+  mutate(across(where(is.character), ~ str_replace_all(., "no", replacement = "false"))) %>%
+  mutate(across(where(is.character), ~ str_replace_all(., "Yes", replacement = "true"))) %>%
+  mutate(across(where(is.character), ~ str_replace_all(., "No", replacement = "false"))) %>%
+  mutate(across(where(is.character), ~ na_if(.,""))) 
+na_count <- sapply(relevant_features_1, function(x) sum(length(which(is.na(x)))))
+na_count <- names(na_count[na_count > 300])
+relevant_features_1 <- relevant_features_1 %>%
+select(-all_of(na_count)) %>%
+  na.omit() %>%
+  mutate(age_years = as.numeric(age_years))
+
+check_distinct_values <- relevant_features_1 %>% 
+  mutate(across(everything(), n_distinct))
+binary_names <- colnames(relevant_features_1)[which(check_distinct_values[1, ] == 2)]
+binary_names <- binary_names[binary_names != "sex"]
+
+food_levels <- c("frozen_dessert_frequency", "one_liter_of_water_a_day_frequency", 
+           "meat_eggs_frequency", "milk_substitute_frequency", "olive_oil",
+           "prepared_meals_frequency", "red_meat_frequency", "seafood_frequency",
+           "sugar_sweetened_drink_frequency",
+           "sugary_sweets_frequency", "whole_eggs", "whole_grain_frequency",
+           "fruit_frequency", "vegetable_frequency")
+normal_levels <- c("probiotic_frequency", "teethbrushing_frequency", 
+           "vitamin_b_supplement_frequency", "vitamin_d_supplement_frequency", 
+           "smoking_frequency", "exercise_frequency", "flossing_frequency"
+           )
+
+food_levels <- food_levels[!food_levels %in% na_count]
+normal_levels <- normal_levels[!normal_levels %in% na_count]
+
+relevant_features_2 <- relevant_features_1 %>%
+  mutate(bmi_cat = as.numeric(factor(bmi_cat, levels = levels_bmi)),
+         bmi_cat = ifelse(is.na(bmi_cat), 0, bmi_cat),
+         sleep_duration = as.numeric(factor(sleep_duration,
+                                     levels = levels_sleep)),
+         sex = as.numeric(sex == "female"),
+         last_travel = as.numeric(last_travel == "I have falset been outside of my country of residence in the past year.")
+        ) %>%
+  mutate(across(.cols = all_of(binary_names), ~ as.numeric(.x == "true"))) %>%
+  mutate(across(.cols = all_of(normal_levels), ~  as.numeric(factor(.x, levels = levels_str))))
+
+relevant_features <- relevant_features_2
+```
+
+Create subset of the original phyloseq object to analyze and root in bacteria
+
+
+```{r} 
+subset_logical <- rownames(relevant_features)
+data_subset <- prune_samples(subset_logical, data)
+agp <- phyloseq(otu_table(data_subset),
+                        tax_table(data_subset),
+                        sample_data(relevant_features))
+agp <- subset_taxa(agp , Rank1 == "k__Bacteria")
+agp
+```
+
+Preprocessing for trac, creating the A matrix
+
+```{r}
+y <- (sample_data(agp)$age_years) 
+tax <- agp@tax_table@.Data
+# add an OTU column
+tax <- cbind(tax, rownames(tax))
+colnames(tax)[ncol(tax)] <- "OTU"
+
+# make it so labels are unique
+for (i in seq(2, 7)) {
+  # add a number when the type is unknown... e.g. "g__"
+  ii <- nchar(tax[, i]) == 3
+  if (sum(ii) > 0)
+    tax[ii, i] <- paste0(tax[ii, i], 1:sum(ii))
+}
+# cumulative labels are harder to read but easier to work with:
+for (i in 2:8) {
+  tax[, i] <- paste(tax[, i-1], tax[, i], sep = "::")
+}
+tax <- as.data.frame(tax, stringsAsFactors = TRUE)
+
+# form phylo object:
+tree1 <- tax_table_to_phylo(~Rank1/Rank2/Rank3/Rank4/Rank5/Rank6/Rank7/OTU,
+                            data = tax, collapse = TRUE)
+
+# convert this to an A matrix to be used for aggregation:
+A <- phylo_to_A(tree1)
+
+dat <- list(y = y,
+            x = t(agp@otu_table@.Data),
+            tree = tree1,
+            tax = tax,
+            A = A,
+            sample_data = as_tibble(sample_data(agp)))
+```
+
+```{r}
+# rows of A correspond to OTUs as do columns of x
+# rearrange columns of x to be in the order of rows of A:
+dat$x <- dat$x[, match(str_match(rownames(A), "::([^:]+)$")[, 2],
+                       colnames(dat$x))]
+identical(str_match(rownames(A), "::([^:]+)$")[,2],
+          colnames(dat$x))
+saveRDS(dat, file = "AGP_processed.RDS")
+
+
+# aggregate to higher levels (for comparison to log-contrast regression at
+# fixed aggregation levels)
+dat <- readRDS("AGP_processed.RDS")
+level_names <- c("Phylum",
+                 "Class",
+                 "Order",
+                 "Family",
+                 "Genus",
+                 "Species",
+                 "OTU")
+dat_agg <- list()
+for (i in seq(1,6)) {
+  dat_agg[[level_names[i]]] <- aggregate_to_level(x = dat$x,
+                                                  y = dat$y, 
+                                                  A = dat$A,
+                                                  tax = dat$tax, 
+                                                  level = i + 2,
+                                                  collapse = TRUE)
+}
+dat_agg[["OTU"]] <- dat
+saveRDS(dat_agg, file = "AGP_aggregated.RDS")
+```
+
+```{r}
+reticulate::py_run_string("import numpy as np; np.infty = np.inf")
+
+dat_list <- readRDS("AGP_aggregated.RDS")
+level_names <- rev(names(dat_list))
+log_pseudo <- function(x, pseudo_count = 1) log(x + pseudo_count)
+
+# apply trac on 10 random train-test splits...
+set.seed(123)
+nsplit <- 10
+ntot <- length(dat_list$OTU$y)
+n <- round(2/3 * ntot)
+
+tr <- list()
+fit <- list()
+cvfit <- list()
+yhat_tr <- list()
+yhat_te <- list()
+trainerr <- list()
+testerr <- list()
+nnz <- list()
+for (j in seq(nsplit)) {
+  cat("split", j, fill = TRUE)
+  tr[[j]] <- sample(ntot, n)
+  fit[[j]] <- list()
+  cvfit[[j]] <- list()
+  yhat_tr[[j]] <- list()
+  yhat_te[[j]] <- list()
+  trainerr[[j]] <- list()
+  testerr[[j]] <- list()
+  nnz[[j]] <- list()
+  for (i in level_names) {
+    cat(i, fill = TRUE)
+    ytr <- dat_list[[i]]$y[tr[[j]]]
+    yte <- dat_list[[i]]$y[-tr[[j]]]
+    ztr <- log_pseudo(dat_list[[i]]$x[tr[[j]], ])
+    zte <- log_pseudo(dat_list[[i]]$x[-tr[[j]], ])
+    fit[[j]][[i]] <- trac(ztr, ytr, A = dat_list[[i]]$A, min_frac = 1e-3, nlam = 100)
+    cvfit[[j]][[i]] <- cv_trac(fit[[j]][[i]], Z = ztr, y = ytr, A = dat_list[[i]]$A)
+    yhat_tr[[j]][[i]] <- predict_trac(fit[[j]][[i]], new_Z = ztr)[[1]]
+    yhat_te[[j]][[i]] <- predict_trac(fit[[j]][[i]], new_Z = zte)[[1]]
+    trainerr[[j]][[i]] <- colMeans((yhat_tr[[j]][[i]] - ytr)^2)
+    testerr[[j]][[i]] <- colMeans((yhat_te[[j]][[i]] - yte)^2)
+    nnz[[j]][[i]] <- colSums(fit[[j]][[i]][[1]]$gamma != 0)
+  }
+}
+save(tr, fit, cvfit, yhat_tr, yhat_te, trainerr, testerr, nnz,
+     file = "trac_fixed_level_multi_splits.Rdata")
+```
+
+```{r}
+dat_list <- readRDS("AGP_aggregated.RDS")
+level_names <- rev(names(dat_list))
+log_pseudo <- function(x, pseudo_count = 1) log(x + pseudo_count)
+
+# apply trac weights on 10 random train-test splits...
+set.seed(123)
+nsplit <- 10
+ntot <- length(dat_list$OTU$y)
+n <- round(2/3 * ntot)
+
+tr <- list()
+fit <- list()
+cvfit <- list()
+yhat_tr <- list()
+yhat_te <- list()
+trainerr <- list()
+testerr <- list()
+nnz <- list()
+for (j in seq(nsplit)) {
+  cat("split", j, fill = TRUE)
+  tr[[j]] <- sample(ntot, n)
+  fit[[j]] <- list()
+  cvfit[[j]] <- list()
+  yhat_tr[[j]] <- list()
+  yhat_te[[j]] <- list()
+  trainerr[[j]] <- list()
+  testerr[[j]] <- list()
+  nnz[[j]] <- list()
+  for (i in level_names) {
+    cat(i, fill = TRUE)
+    ytr <- dat_list[[i]]$y[tr[[j]]]
+    yte <- dat_list[[i]]$y[-tr[[j]]]
+    ztr <- log_pseudo(dat_list[[i]]$x[tr[[j]], ])
+    zte <- log_pseudo(dat_list[[i]]$x[-tr[[j]], ])
+    fit[[j]][[i]] <- trac(ztr, ytr, A = dat_list[[i]]$A, min_frac = 1e-3,
+                          nlam = 30, w = colSums(dat_list[[i]]$A)^0.5)
+    cvfit[[j]][[i]] <- cv_trac(fit[[j]][[i]], Z = ztr, y = ytr, A = dat_list[[i]]$A)
+    yhat_tr[[j]][[i]] <- predict_trac(fit[[j]][[i]], new_Z = ztr)[[1]]
+    yhat_te[[j]][[i]] <- predict_trac(fit[[j]][[i]], new_Z = zte)[[1]]
+    trainerr[[j]][[i]] <- colMeans((yhat_tr[[j]][[i]] - ytr)^2)
+    testerr[[j]][[i]] <- colMeans((yhat_te[[j]][[i]] - yte)^2)
+    nnz[[j]][[i]] <- colSums(fit[[j]][[i]][[1]]$gamma != 0)
+  }
+}
+# verify that these are same train-test splits as for trac:
+load("trac_fixed_level_multi_splits.Rdata", envir = trac <- new.env())
+stopifnot(identical(tr, trac$tr))
+save(tr, fit, cvfit, yhat_tr, yhat_te, trainerr, testerr, nnz,
+     file = "trac_weights_fixed_level_multi_splits.Rdata")
+```
+
+```{r}
+dat_list <- readRDS("AGP_aggregated.RDS")
+level_names <- rev(names(dat_list))
+log_pseudo <- function(x, pseudo_count = 1) log(x + pseudo_count)
+
+# apply complasso on 10 random train-test splits...
+set.seed(123)
+nsplit <- 10
+ntot <- length(dat_list$OTU$y)
+n <- round(2/3 * ntot)
+
+tr <- list()
+fit <- list()
+cvfit <- list()
+yhat_tr <- list()
+yhat_te <- list()
+trainerr <- list()
+testerr <- list()
+nnz <- list()
+for (j in seq(nsplit)) {
+  cat("split", j, fill = TRUE)
+  tr[[j]] <- sample(ntot, n)
+  fit[[j]] <- list()
+  cvfit[[j]] <- list()
+  yhat_tr[[j]] <- list()
+  yhat_te[[j]] <- list()
+  trainerr[[j]] <- list()
+  testerr[[j]] <- list()
+  nnz[[j]] <- list()
+  for (i in level_names) {
+    cat(i, fill = TRUE)
+    ytr <- dat_list[[i]]$y[tr[[j]]]
+    yte <- dat_list[[i]]$y[-tr[[j]]]
+    x_tr <- as.matrix(dat_list[[i]]$x[tr[[j]], ])
+    x_te <- as.matrix(dat_list[[i]]$x[-tr[[j]], ])
+    ztr <- log_pseudo(x_tr)
+    zte <- log_pseudo(x_te) 
+    fit[[j]][[i]] <- sparse_log_contrast(ztr, ytr, min_frac = 1e-3, nlam = 30)
+    cvfit[[j]][[i]] <- cv_sparse_log_contrast(fit[[j]][[i]], Z = ztr, y = ytr)
+    yhat_tr[[j]][[i]] <- predict_trac(list(fit[[j]][[i]]), new_Z = ztr)[[1]]
+    yhat_te[[j]][[i]] <- predict_trac(list(fit[[j]][[i]]), new_Z = zte)[[1]]
+    trainerr[[j]][[i]] <- colMeans((yhat_tr[[j]][[i]] - ytr)^2)
+    testerr[[j]][[i]] <- colMeans((yhat_te[[j]][[i]] - yte)^2)
+    nnz[[j]][[i]] <- colSums(fit[[j]][[i]]$beta != 0)
+  }
+}
+# verify that these are same train-test splits as for trac:
+load("trac_fixed_level_multi_splits.Rdata", envir = trac <- new.env())
+stopifnot(identical(tr, trac$tr))
+save(tr, fit, cvfit, yhat_tr, yhat_te, trainerr, testerr, nnz,
+     file = "complasso_fixed_level_multi_splits.Rdata")
+```
+
+gheatmap
+```{r}
+#' A light modification of scales::modulus_trans
+modulus_trans_scaled <- function (p, offset = 1, scaling = 1) {
+  if (abs(p) < 1e-07) {
+    trans <- function(x) sign(x) * log(abs(x / scaling) + offset)
+    inv <- function(x) scaling * sign(x) * (exp(abs(x)) - offset)
+  }
+  else {
+    trans <- function(x) sign(x) * ((abs(x/scaling) + offset)^p - 
+                                      1)/p
+    inv <- function(x) scaling * sign(x) * ((abs(x) * p + 1)^(1/p) - 
+                                    offset)
+  }
+  scales::trans_new(paste0("scaled-mt-pow-", format(p)), trans, inv)
+}
+
+gheatmap_modified <- function(p,
+                              data,
+                              offset = 0,
+                              width = 1,
+                              low = "red",
+                              high = "blue",
+                              color = "white",
+                              colnames = TRUE,
+                              colnames_position = "bottom",
+                              colnames_angle = 0,
+                              colnames_level = NULL,
+                              colnames_offset_x = 0,
+                              colnames_offset_y = 0,
+                              font.size = 4,
+                              family = "",
+                              hjust = 0.5,
+                              legend_title = "value",
+                              hide_legend = FALSE,
+                              scaling = 1) {
+  
+  colnames_position <- colnames_position %>% match.arg(c("bottom", "top"))
+  variable <- value <- lab <- y <- NULL
+  
+  ## if (is.null(width)) {
+  ##     width <- (p$data$x %>% range %>% diff)/30
+  ## }
+  
+  ## convert width to width of each cell
+  width <- width * (p$data$x %>% range(na.rm=TRUE) %>% diff) / ncol(data)
+  
+  isTip <- x <- y <- variable <- value <- from <- to <- NULL
+  
+  ## handle the display of heatmap on collapsed nodes
+  ## https://github.com/GuangchuangYu/ggtree/issues/242
+  ## extract data on leaves (& on collapsed internal nodes) 
+  ## (the latter is extracted only when the input data has data on collapsed
+  ## internal nodes)
+  df <- p$data
+  nodeCo <- intersect(df %>% filter(is.na(x)) %>% 
+                        select(.data$parent, .data$node) %>% unlist(), 
+                      df %>% filter(!is.na(x)) %>% 
+                        select(.data$parent, .data$node) %>% unlist())
+  labCo <- df %>% filter(.data$node %in% nodeCo) %>% 
+    select(.data$label) %>% unlist()
+  selCo <- intersect(labCo, rownames(data))
+  isSel <- df$label %in% selCo
+  
+  df <- df[df$isTip | isSel, ]
+  start <- max(df$x, na.rm=TRUE) + offset
+  
+  dd <- as.data.frame(data)
+  ## dd$lab <- rownames(dd)
+  i <- order(df$y)
+  
+  ## handle collapsed tree
+  ## https://github.com/GuangchuangYu/ggtree/issues/137
+  i <- i[!is.na(df$y[i])]
+  
+  lab <- df$label[i]
+  ## dd <- dd[lab, , drop=FALSE]
+  ## https://github.com/GuangchuangYu/ggtree/issues/182
+  dd <- dd[match(lab, rownames(dd)), , drop = FALSE]
+  
+  
+  dd$y <- sort(df$y)
+  dd$lab <- lab
+  ## dd <- melt(dd, id=c("lab", "y"))
+  dd <- gather(dd, variable, value, -c(lab, y))
+  
+  i <- which(dd$value == "")
+  if (length(i) > 0) {
+    dd$value[i] <- NA
+  }
+  if (is.null(colnames_level)) {
+    dd$variable <- factor(dd$variable, levels=colnames(data))
+  } else {
+    dd$variable <- factor(dd$variable, levels=colnames_level)
+  }
+  V2 <- start + as.numeric(dd$variable) * width
+  mapping <- data.frame(from=dd$variable, to=V2)
+  mapping <- unique(mapping)
+  
+  dd$x <- V2
+  dd$width <- width
+  dd[[".panel"]] <- factor("Tree")
+  if (is.null(color)) {
+    p2 <- p + geom_tile(data=dd, aes(x, y, fill=value), width=width, inherit.aes=FALSE)
+  } else {
+    p2 <- p + geom_tile(data=dd, aes(x, y, fill=value), width=width, color=color, inherit.aes=FALSE)
+  }
+  if (is(dd$value,"numeric")) {
+    p2 <- p2 + scale_fill_gradient2(low=low,
+                                    high=high, 
+                                    na.value=NA, 
+                                    name = legend_title,
+                                    #trans = scales::modulus_trans(-1),
+                                    trans = modulus_trans_scaled(p=-1, scaling = scaling),
+                                    breaks = function(x) {
+                                      return(unique(c(min(x), 0, max(x))))
+                                      },
+                                    labels = function(x) format(x,digits=1)) # "white")
+  } else {
+    p2 <- p2 + scale_fill_discrete(na.value=NA, name = legend_title) #"white")
+  }
+  
+  if (colnames) {
+    if (colnames_position == "bottom") {
+      y <- 0
+    } else {
+      y <- max(p$data$y) + 1
+    }
+    mapping$y <- y
+    mapping[[".panel"]] <- factor("Tree")
+    # p2 <- p2 + geom_text(data=mapping, aes(x=to, y = y, label=from), size=font.size, family=family, inherit.aes = FALSE,
+    #                      angle=colnames_angle, nudge_x=colnames_offset_x, nudge_y = colnames_offset_y, hjust=hjust)
+  }
+  
+  if (hide_legend) {
+  p2 <- p2 + theme(legend.position="none")
+  } else {
+    p2 <- p2 + theme(legend.position="right")
+  }
+  ## p2 <- p2 + guides(fill = guide_legend(override.aes = list(colour = NULL)))
+  
+  if (!colnames) {
+    ## https://github.com/GuangchuangYu/ggtree/issues/204
+    p2 <- p2 + scale_y_continuous(expand = c(0,0))
+  }
+  
+  attr(p2, "mapping") <- mapping
+  return(p2)
+}
+```
+
+visualize tree
+```{r}
+
+plot_features_on_tree_with_complasso <- function(tree, 
+                                                 gamma, # from trac 
+                                                 A,
+                                                 beta_complasso,
+                                                 thickness = 0.5,
+                                                 scaling = 1) {
+  # get the aggregation nodes:
+  agg_nodes <- which(abs(gamma) > 1e-8)
+  agg_names <- rownames(gamma)[agg_nodes]
+  agg_short_names <- str_split(agg_names, "::") %>% map_chr(~ rev(.x)[1])
+  # partition the leaves based on this:
+  leaf_assign <- apply(A[, agg_nodes], 1, function(row) which(row == 1)[1])
+  leaf_assign <- agg_short_names[leaf_assign]
+  #agg_short_names <- c(agg_short_names, "Other")
+  #leaf_assign[is.na(leaf_assign)] <- "Other"
+  # group the leaves so that the tree will be colored accordingly:
+  grp <- agg_short_names %>% 
+    map(~ which(leaf_assign == .x)) %>% 
+    set_names(agg_short_names)
+  tree <- groupOTU(tree, grp, "Selected Taxa")
+  plt <- ggtree(tree, aes(color = `Selected Taxa`,
+                          alpha = 1 - 0.01 * (`Selected Taxa` == "Other" |
+                                               str_detect(`Selected Taxa`, "Bacteria"))
+                          ),
+                layout = "circular",
+                branch.length = "none", 
+                size = thickness
+                ) + 
+    theme(legend.position="bottom") +
+    scale_alpha(guide = 'none')
+  if ("0" %in% levels(plt$data$`Selected Taxa`))
+    levels(plt$data$`Selected Taxa`)[levels(plt$data$`Selected Taxa`) == "0"] <- "Other"
+  # put a heatmap along the perimeter giving beta's value:
+  beta <- data.frame(beta = as.numeric(A %*% gamma))
+  beta[beta == 0] <- NA
+  rownames(beta) <- tree$tip.label
+  plt <- gheatmap_modified(plt, beta, width = 0.1, color = NA, 
+                           legend_title = "beta", scaling = scaling)
+
+  plt$data <- plt$data %>%
+    mutate(otu = str_extract(label,"::[^:]+$") %>% 
+             str_remove("::")) %>% # extract leaf-level part of taxon label
+    left_join(tibble(beta_cl = beta_complasso[,1],
+                     otu = rownames(beta_complasso)),
+              by = "otu")
+  plt <- plt + geom_tippoint(data = plt$data %>% filter(beta_cl != 0),
+                             color = "black", size = 0.5, alpha = 1)
+  return(plt)
+}
+```
+
+```{r}
+
+dat <- readRDS("AGP_processed.RDS")
+load("trac_fixed_level_multi_splits.Rdata")
+yhat_tr <- list(yhat_tr[[1]]$OTU)
+yhat_te <- list(yhat_te[[1]]$OTU)
+testerr <- testerr[[1]]$OTU
+cvfit <- cvfit[[1]]$OTU
+fit <- fit[[1]]$OTU
+yte <- dat$y[-tr[[1]]]
+ytr <- dat$y[tr[[1]]]
+
+g <- list()
+
+# cv curve
+g[[1]] <- tibble(mean_cv = cvfit$cv[[1]]$m,
+                 lower_cv = cvfit$cv[[1]]$m - cvfit$cv[[1]]$se,
+                 upper_cv = cvfit$cv[[1]]$m + cvfit$cv[[1]]$se,
+                 non_zero = cvfit$cv[[1]]$nonzeros
+) %>% 
+  ggplot(aes(x = non_zero, y = mean_cv, ymin = lower_cv, ymax = upper_cv)) +
+  geom_point() +
+  geom_line() +
+  geom_errorbar() +
+  geom_vline(xintercept = cvfit$cv[[1]]$nonzeros[c(cvfit$cv[[1]]$i1se,
+                                                   cvfit$cv[[1]]$ibest)],
+             lty = 2:3) +
+  labs(title = "B: Cross Validation", y = "CV Error", x = "Number of nonzero alpha")
+
+# coefficient paths
+g[[2]] <- fit[[1]]$alpha %>%
+  t() %>% 
+  as_tibble() %>% 
+  mutate(frac = fit[[1]]$fraclist) %>% 
+  pivot_longer(cols = -frac) %>% 
+  ggplot(aes(x = frac, y = value, group = name, color = name)) + 
+  geom_line() + 
+  scale_x_log10() + 
+  theme(legend.position = "none") + 
+  geom_vline(xintercept = cvfit$cv[[1]]$fraclist[c(cvfit$cv[[1]]$i1se,
+                                                   cvfit$cv[[1]]$ibest)],
+             lty = 2:3) +
+  labs(title = "A: Solution Path", y = "alpha", x = "Fraction of lambda_max")
+
+# test error curve
+g[[3]] <- tibble(testerr = testerr,
+                 non_zero = cvfit$cv[[1]]$nonzeros
+) %>% 
+  ggplot(aes(x = non_zero, y = testerr)) +
+  geom_point() +
+  geom_line() +
+  geom_vline(xintercept = cvfit$cv[[1]]$nonzeros[c(cvfit$cv[[1]]$i1se,
+                                                   cvfit$cv[[1]]$ibest)],
+             lty = 2:3) + 
+  labs(title = "D: Error on Test Set", y = "Test Error", x = "Number of nonzero alpha")
+
+g[[4]] <- tibble(yte = yte,
+                 yhat_te = yhat_te[[1]][, cvfit$cv[[1]]$i1se]
+) %>% 
+  ggplot(aes(x = yhat_te, y = yte)) +
+  geom_point() + 
+  geom_abline(slope = 1, intercept = 0) +
+  labs(title = "Test Set Performance", x = "Predicted", y = "Actual")
+
+g[[5]] <- tibble(yte = yte,
+                 `CV 1SE rule` = yhat_te[[1]][, cvfit$cv[[1]]$i1se],
+                 `CV Best` = yhat_te[[1]][, cvfit$cv[[1]]$ibest],
+) %>% 
+  pivot_longer(cols = 2:3, names_to = "lambda") %>% 
+  ggplot(aes(x = value, y = yte, color = lambda)) +
+  geom_point(size = 2) + 
+  geom_abline(slope = 1, intercept = 0) +
+  labs(title = "C: Test Set Performance", x = "Predicted", y = "Actual") +
+  # theme(legend.position = "bottom") +
+  coord_equal()
+
+cor(yte, yhat_te[[1]][, cvfit$cv[[1]]$ibest])
+cor(ytr, yhat_tr[[1]][, cvfit$cv[[1]]$ibest])
+cor(yte, yhat_te[[1]][, cvfit$cv[[1]]$i1se])
+cor(ytr, yhat_tr[[1]][, cvfit$cv[[1]]$i1se])
+
+gr <- g[c(2,1,5,3)] %>% 
+map(ggplotGrob) %>% 
+  arrangeGrob(grobs = ., ncol = 2)
+ggsave(gr, filename = "agp.pdf", width = 10, height = 6)
+```
+
+visualization
+```{r}
+agp_trac_figure <- function() {
+  dat <- readRDS("AGP_processed.RDS")
+  load("trac_fixed_level_multi_splits.Rdata")
+  i1se <- cvfit[[1]]$OTU$cv[[1]]$i1se
+  
+  load("complasso_fixed_level_multi_splits.Rdata",
+       envir = cl <- new.env())
+  i1se_cl <- cl$cvfit[[1]]$OTU$cv$i1se
+  gam <- fit[[1]]$OTU[[1]]$gamma[, i1se, drop = FALSE]  
+  prefix <- c("", "k__", "p__", "c__", "o__", "f__", "g__", "")
+  rownames(gam) <- rownames(gam) %>% 
+    str_split("::") %>% 
+    map(~ paste0(prefix[1:length(.x)], .x, collapse = "::"))
+  g <- plot_features_on_tree_with_complasso(dat$tree, gam,
+                                            A = dat$A,
+                                            beta_complasso = cl$fit[[1]]$OTU$beta[, i1se_cl, drop = FALSE])
+  # make lines thicker in "Selected Taxa" legend
+  g <- g + guides(color = guide_legend(override.aes = list(size = 2),
+                                       label.theme = element_text(size = 10)))
+  
+  final_plot <- g + labs(title = "A: trac (a = 1)")
+  ggsave("AGP_Age_trac.pdf"#, width = 6.5, height = 4.58
+         )
+}
+
+agp_trac_weights_figure <- function() {
+  dat <- readRDS("AGP_processed.RDS")
+  load("trac_weights_fixed_level_multi_splits.Rdata")
+  i1se <- cvfit[[1]]$OTU$cv[[1]]$i1se
+  
+  load("complasso_fixed_level_multi_splits.Rdata",
+       envir = cl <- new.env())
+  i1se_cl <- cl$cvfit[[1]]$OTU$cv$i1se
+
+  gam <- fit[[1]]$OTU[[1]]$gamma[, i1se, drop = FALSE]  
+  prefix <- c("", "k__", "p__", "c__", "o__", "f__", "g__", "")
+  rownames(gam) <- rownames(gam) %>% 
+    str_split("::") %>% 
+    map(~ paste0(prefix[1:length(.x)], .x, collapse = "::"))
+  g <- plot_features_on_tree_with_complasso(dat$tree, gam,
+                                            A = dat$A,
+                                            beta_complasso = cl$fit[[1]]$OTU$beta[, i1se_cl, drop = FALSE])
+  # make lines thicker in "Selected Taxa" legend
+  g <- g + guides(color = guide_legend(override.aes = list(size = 2),
+                                       label.theme = element_text(size = 8),
+                                       keyheight = unit(0.1, "lines")
+                                       )) 
+  final_plot <- g + labs(title = "B: trac (a = 1/2)") 
+  ggsave("AGP_Age_trac_weights.pdf",
+             width = 6.5,
+             height = 4.58)
+}
+
+agp_trac_family_on_otu_tree_figure <- function() {
+  dat_list <- readRDS("AGP_aggregated.RDS")
+  load("trac_fixed_level_multi_splits.Rdata")
+  i1se <- cvfit[[1]]$Family$cv[[1]]$i1se
+  
+  load("complasso_fixed_level_multi_splits.Rdata",
+       envir = cl <- new.env())
+  i1se_cl <- cl$cvfit[[1]]$Family$cv$i1se
+  
+  gamma <- fit[[1]]$Family[[1]]$gamma[, i1se, drop = FALSE]
+  
+  names_gamma_template <- rownames(fit[[1]]$OTU[[1]]$gamma)
+  gamma_template <- matrix(0, nrow = length(names_gamma_template), ncol = 1)
+  rownames(gamma_template) <- names_gamma_template
+  
+  ii_gamma_template <- match(rownames(gamma),rownames(gamma_template))
+  ii_gamma <- which(!is.na(ii_gamma_template))
+  gamma_template[ii_gamma_template[!is.na(ii_gamma_template)], ] <- gamma[ii_gamma]
+  
+  for (j in which(is.na(ii_gamma_template))) {
+    # loop over families with single child (and therefore a node corresponding to
+    # this family is not present in OTU-level tree)
+    family_name <- rownames(gamma)[j]
+    # get all descendants of this family:
+    ind <- str_which(rownames(gamma_template), family_name)
+    if (length(ind) > 1) {
+      # if there are multiple descendants, let's find the child of the family
+      # (which must be unique) so that we can assign gamma[j] to that taxon's 
+      # gamma_template value:
+      ii <- ind[which.min(str_count(names_gamma_template[ind], "::"))]
+    } else {
+      # if a unique descendant exists, then we will just assign gamma[j] to that descendant:
+      ii <- ind
+    }
+    # do the assignment:
+    gamma_template[ii] <- gamma[j]
+    # let's remove the last part of the name so that it will be labeled
+    # as a family rather than a genus:
+    rownames(gamma_template)[ii] <- str_remove(rownames(gamma_template)[ii],
+                                               "::[^:]+$")
+  }
+  
+  otu_names <- rownames(dat_list$OTU$A)
+  beta_cl <- matrix(0, nrow = length(otu_names), ncol = 1)
+  rownames(beta_cl) <- otu_names
+  
+  beta_family_cl <- cl$fit[[1]]$Family$beta[, i1se_cl, drop = FALSE]
+  cl_selected_families <- names(beta_family_cl[beta_family_cl!=0,])
+  for (nam in cl_selected_families) {
+    ii <- str_detect(otu_names, nam)
+    beta_cl[ii,] <- 1
+  }
+  rownames(beta_cl) <- rownames(beta_cl) %>% 
+    str_extract("::[^:]+$") %>% 
+    str_remove("::")
+  
+  prefix <- c("", "k__", "p__", "c__", "o__", "f__", "g__", "")
+  rownames(gamma_template) <- rownames(gamma_template) %>% 
+    str_split("::") %>% 
+    map(~ paste0(prefix[1:length(.x)], .x, collapse = "::"))
+
+  g <- plot_features_on_tree_with_complasso(dat_list$OTU$tree, 
+                                            gamma_template,
+                                            A = dat_list$OTU$A,
+                                            beta_complasso = beta_cl)
+  # make lines thicker in "Selected Taxa" legend
+  g <- g + guides(color = guide_legend(override.aes = list(size = 2)))
+  final_plot <- g + labs(title = "C: trac on family level (a = 1)") 
+  ggsave("AGP_Age_trac_family_on_otu_tree.pdf",
+           width = 6.5,
+           height = 4.58)
+}
+
+agp_trac_weights_family_on_otu_tree_figure <- function() {
+  dat_list <- readRDS("AGP_aggregateded.RDS")
+  load("trac_weights_fixed_level_multi_splits.Rdata")
+  i1se <- cvfit[[1]]$Family$cv[[1]]$i1se
+  
+  load("complasso_fixed_level_multi_splits.Rdata",
+       envir = cl <- new.env())
+  i1se_cl <- cl$cvfit[[1]]$Family$cv$i1se
+  
+  gamma <- fit[[1]]$Family[[1]]$gamma[, i1se, drop = FALSE]
+  
+  names_gamma_template <- rownames(fit[[1]]$OTU[[1]]$gamma)
+  gamma_template <- matrix(0, nrow = length(names_gamma_template), ncol = 1)
+  rownames(gamma_template) <- names_gamma_template
+  
+  ii_gamma_template <- match(rownames(gamma),rownames(gamma_template))
+  ii_gamma <- which(!is.na(ii_gamma_template))
+  gamma_template[ii_gamma_template[!is.na(ii_gamma_template)], ] <- gamma[ii_gamma]
+  
+  for (j in which(is.na(ii_gamma_template))) {
+    # loop over families with single child (and therefore a node corresponding to
+    # this family is not present in OTU-level tree)
+    family_name <- rownames(gamma)[j]
+    # get all descendants of this family:
+    ind <- str_which(rownames(gamma_template), family_name)
+    if (length(ind) > 1) {
+      # if there are multiple descendants, let's find the child of the family
+      # (which must be unique) so that we can assign gamma[j] to that taxon's 
+      # gamma_template value:
+      ii <- ind[which.min(str_count(names_gamma_template[ind], "::"))]
+    } else {
+      # if a unique descendant exists, then we will just assign gamma[j] to that descendant:
+      ii <- ind
+    }
+    # do the assignment:
+    gamma_template[ii] <- gamma[j]
+    # let's remove the last part of the name so that it will be labeled
+    # as a family rather than a genus:
+    rownames(gamma_template)[ii] <- str_remove(rownames(gamma_template)[ii],
+                                               "::[^:]+$")
+  }
+
+  otu_names <- rownames(dat_list$OTU$A)
+  beta_cl <- matrix(0, nrow = length(otu_names), ncol = 1)
+  rownames(beta_cl) <- otu_names
+  
+  beta_family_cl <- cl$fit[[1]]$Family$beta[, i1se_cl, drop = FALSE]
+  cl_selected_families <- names(beta_family_cl[beta_family_cl!=0,])
+  for (nam in cl_selected_families) {
+    ii <- str_detect(otu_names, nam)
+    beta_cl[ii,] <- 1
+  }
+  rownames(beta_cl) <- rownames(beta_cl) %>% 
+    str_extract("::[^:]+$") %>% 
+    str_remove("::")
+
+  prefix <- c("", "k__", "p__", "c__", "o__", "f__", "g__", "")
+  rownames(gamma_template) <- rownames(gamma_template) %>% 
+    str_split("::") %>% 
+    map(~ paste0(prefix[1:length(.x)], .x, collapse = "::"))
+  
+  
+  g <- plot_features_on_tree_with_complasso(dat_list$OTU$tree, 
+                                            gamma_template,
+                                            A = dat_list$OTU$A,
+                                            beta_complasso = beta_cl)
+  # make lines thicker in "Selected Taxa" legend
+  g <- g + guides(color = guide_legend(override.aes = list(size = 2)))
+  final_plot <- g + labs(title = "D: trac on family level (a = 1/2)") 
+  ggsave("AGP_Age_trac_weights_family_on_otu_tree.pdf",
+           width = 6.5,
+           height = 4.58)
+}
+```
+
+```{r}
+agp_trac_figure()
+agp_trac_weights_figure()
+agp_trac_family_on_otu_tree_figure()
+agp_trac_weights_family_on_otu_tree_figure()
+```
+
+y vs yhat
+```{r}
+dat <- readRDS("AGP_processed.RDS")
+load("trac_fixed_level_multi_splits.Rdata")
+
+# show the y vs yhat plot for the first split:
+p <- tibble(yte = dat$y[-tr[[1]]],
+       yhat_te = yhat_te[[1]]$OTU[, cvfit[[1]]$OTU$cv[[1]]$i1se]
+) %>% 
+  ggplot(aes(x = yhat_te, y = yte)) +
+  geom_point(alpha = 0.1) + 
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Test Set Performance", x = "Predicted Age", y = "Actual Age") +
+  coord_fixed() 
+  
+ggsave(filename = "age.pdf", plot = p, width = 7, height = 7)
+
+
+cor(dat$y[-tr[[1]]], yhat_te[[1]]$OTU[, cvfit[[1]]$OTU$cv[[1]]$i1se])
+```
+
+
+test error table
+```{r} 
+lower_levels <- c("OTU", "Genus", "Family")
+methods_data <- list()
+
+# load AGP:
+load("complasso_fixed_level_multi_splits.Rdata", e = cl <- new.env())
+load("trac_fixed_level_multi_splits.Rdata", e = trac <- new.env())
+load("trac_weights_fixed_level_multi_splits.Rdata", e = trac_weights <- new.env())
+cl$cvfit <- cl$cvfit %>% map(~ .x %>% 
+                               map(~ {
+                                 .x$cv <- list(.x$cv)
+                                 return(.x)
+                               }))
+methods_data[["Gut (AGP): Age"]] <- list(
+  "Sparse Log-Contrast" = cl,
+  "trac (a = 1)" = trac, 
+  "trac (a = 1/2)" = trac_weights
+)
+
+both_1se <- list()
+for (d in names(methods_data)) {
+  both_1se_list <- list()
+  for (i in names(methods_data[[d]])) {
+    testerr <- methods_data[[d]][[i]]$testerr %>%
+      map_dfr( ~ .x %>% 
+                 bind_cols() %>% 
+                 mutate(ilam = row_number()) %>% 
+                 pivot_longer(-ilam, names_to = "Level", values_to = "test_error"),
+               .id = "Split")
+    i1se <- methods_data[[d]][[i]]$cvfit %>% 
+      map_dfr(~.x %>% map_dbl(~ .x$cv[[1]]$i1se)) %>%
+      mutate(Split = as.character(row_number())) %>% 
+      pivot_longer(-Split, names_to="Level", values_to="i1se")
+    testerr_1se <- testerr %>% left_join(i1se, by = c("Level", "Split")) %>% 
+      filter(ilam == i1se)
+    nnz <- methods_data[[d]][[i]]$nnz %>%
+      map_dfr( ~ .x %>% 
+                 bind_cols() %>% 
+                 mutate(ilam = row_number()) %>% 
+                 pivot_longer(-ilam, names_to = "Level", values_to = "nnz"),
+               .id = "Split")
+    nnz_1se <- nnz %>% left_join(i1se, by = c("Level", "Split")) %>% 
+      filter(ilam == i1se)
+    both_1se_list[[i]] <- testerr_1se %>% left_join(nnz_1se, by = c("ilam", "Level", "Split"))
+  }
+  both_1se[[d]] <- bind_rows(both_1se_list, .id = "Method")
+}
+
+all <- bind_rows(both_1se, .id = "Data") %>% select(-ilam, -i1se.x, -i1se.y)
+
+tbl <- all %>% 
+  filter(Level %in% lower_levels) %>% 
+  group_by(Data, Method, Level) %>% 
+  summarize(mean_1se_err = mean(test_error),
+            mean_1se_nnz = mean(nnz)) %>% 
+  ungroup() %>% 
+  mutate(value = sprintf("%.2g (%s)", mean_1se_err, round(mean_1se_nnz))) %>% 
+  mutate(Data = fct_relevel(factor(Data), names(methods_data)[c(1,3,2)])) %>% 
+  arrange(Data) %>% 
+  select(-mean_1se_err, -mean_1se_nnz) %>% 
+  pivot_wider(all_of(c("Data", "Level")), names_from = Method, values_from = value) %>% 
+  relocate(`Sparse Log-Contrast`, .after = last_col())
+
+# get dimension of each data-level pair
+dims <- map_dfr(methods_data, 
+        ~ map_dfr(.x[[1]]$fit[[1]][lower_levels], ~ nrow(.x$beta)), .id = "Data") %>% 
+  pivot_longer(-Data, names_to = "Level", values_to = "$p$")
+
+tbl <- tbl %>% 
+  left_join(dims, by = c("Data", "Level")) %>% 
+  relocate(`$p$`, .after = Level)
+
+dat_labs <- unique(tbl$Data)
+dat_shortlabs <- c("AGP")
+for (i in seq_along(dat_labs)) {
+  tbl %>%
+    filter(Data == dat_labs[i]) %>% 
+    select(-Data) %>% 
+    mutate(Level = fct_relevel(factor(Level), c("OTU", "Genus", "Family"))) %>% 
+    arrange(Level) %>% 
+    rename(`Base Level` = Level) %>% 
+    knitr::kable(format = "latex",
+                 booktabs = TRUE,
+                 escape = FALSE,
+                 linesep = "") %>%
+    kableExtra::kable_styling(latex_options = c("striped", "scale_down")) %>%
+    kableExtra::row_spec(0, bold = TRUE) %>%
+    str_remove("\\\\begin\\{table\\}") %>% 
+    str_remove("\\\\end\\{table\\}") %>% 
+    cat(file = sprintf("test_error_table.tex", dat_shortlabs[i]))
+}
+```
+
+
+coefficients
+```{r}
+
+method_name <- "trac"
+method_long_name <- "{\\tt trac} (a = 1)"
+tax_levels <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species", "OTU")
+ntop <- 15
+
+# ---- SINGLE FILE ----
+# change this to the file you want to analyze
+trac_file <- "trac_fixed_level_multi_splits.Rdata"
+dataset_name <- "Gut (AGP): Age"   # name for captions
+short_name <- "agp"
+
+# ---- LOAD FILE ----
+load(trac_file, envir = e <- new.env())
+fit <- e$fit[[1]]$OTU
+cvfit <- e$cvfit[[1]]$OTU
+
+# ---- EXTRACT COEFFICIENTS ----
+alpha_cv1se <- round(fit[[1]]$alpha[, cvfit$cv[[1]]$i1se], 6)
+names(alpha_cv1se) <- names(alpha_cv1se) %>% str_remove_all("[a-z]__")
+
+# taxonomy split
+into <- tax_levels
+if (str_starts(names(alpha_cv1se)[1], "Life"))
+  into <- c(NA, into) # handle case where taxonomy starts with Life
+
+selected <- enframe(alpha_cv1se) %>%
+  separate(name,
+           into = into,
+           sep = "::",
+           remove = FALSE,
+           fill = "right") %>%
+  filter(value != 0)
+
+# ---- CAPTION ----
+caption <- ifelse(nrow(selected) > ntop,
+                  sprintf("Top %s coefficients selected by %s for %s",
+                          ntop, method_long_name, dataset_name),
+                  sprintf("Coefficients selected by %s for %s", 
+                          method_long_name,
+                          dataset_name))
+
+caption <- sprintf("\\label{fig:%s-%s} %s", 
+                   str_remove_all(dataset_name, "[^[:alnum:]]"),
+                   method_name,
+                   caption)
+
+# ---- BUILD LATEX TABLE ----
+latex_tbl <- selected %>%
+  arrange(-abs(value)) %>%
+  select(-name) %>%
+  mutate(value = formatC(value, digits = 2, format = "f")) %>%
+  mutate_all(~ replace_na(., "")) %>%
+  mutate_at(vars(-OTU), ~ str_replace(., "^\\d+$", "-")) %>%
+  slice(1:ntop) %>%
+  kable(format = "latex",
+        align = c(rep("c", ncol(selected) - 2), "r"),
+        booktabs = TRUE,
+        caption = caption) %>%
+  kable_styling(latex_options = c("striped", "scale_down")) %>%
+  row_spec(0, bold = TRUE) %>%
+  str_replace("value", "$\\\\alpha$")
+
+# ---- SAVE OUTPUT ----
+cat(latex_tbl, file = paste0("", method_name, "_", short_name, ".tex"))
+
+```

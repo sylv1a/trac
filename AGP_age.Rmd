@@ -1,0 +1,1573 @@
+---
+title: "AGP Age Prediction"
+output: 
+  html_document:    
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(reticulate)
+# Change if needed
+use_condaenv("trac")
+library(tidyverse)
+library(phyloseq)
+library(trac)
+library(knitr)
+library(kableExtra)
+```
+
+# Age analysis with trac and two-stage procedure
+
+The aim of this document is to detect potential log-ratio pairs of possibly aggregated microbiome (compositional) data with additional non-compositional covariates that are predictive of age based on the American Gut Project data obtained from the reproducible repo of the trac paper.
+
+## Preprocess data
+
+
+```{r}
+data <- readRDS("D:/KUSS/School/Biostat seminar/AGP_BMI_cat/data/AGP_10.RDS")
+data_subset <- data.frame(data@sam_data)  
+```
+
+
+Extract a host related variables with subjects not having diabetes or have taken antibiotics the last year.
+
+
+```{r}
+levels_str <- c("Never", 
+                "Rarely (a few times/month)",
+                "Occasionally (1-2 times/week)",
+                "Regularly (3-5 times/week)",
+                "Daily")
+level_str_food <- c("Never", 
+                "Rarely (less than once/week)",
+                "Occasionally (1-2 times/week)",
+                "Regularly (3-5 times/week)",
+                "Daily")
+levels_sleep <- c("Less than 5 hours", 
+                 "5-6 hours",
+                 "6-7 hours",
+                 "7-8 hours",
+                 "8 or more hours")
+levels_bmi <- c("Underweight",
+                "Normal",
+                "Overweight",
+                "Obese")
+
+relevant_features_1 <- data_subset %>%
+  select(bmi_cat,
+         alcohol_consumption,
+         exercise_frequency,
+         sleep_duration,
+         fruit_frequency,
+         vegetable_frequency,
+         age_years,
+         sex,
+         antibiotic_history,
+         diabetes,
+         non_food_allergies_unspecified,
+         allergic_to_i_have_no_food_allergies_that_i_know_of,
+         dog,
+         flossing_frequency,
+         frozen_dessert_frequency,
+         last_travel,
+         last_move,
+         milk_substitute_frequency,
+         nail_biter,
+         meat_eggs_frequency,
+         olive_oil,
+         one_liter_of_water_a_day_frequency,
+         prepared_meals_frequency,
+         probiotic_frequency,
+         red_meat_frequency,
+         seafood_frequency,
+         smoking_frequency,
+         sugar_sweetened_drink_frequency,
+         sugary_sweets_frequency,
+         teethbrushing_frequency,
+         vitamin_b_supplement_frequency,
+         vitamin_d_supplement_frequency,
+         whole_eggs,
+         whole_grain_frequency) %>%
+  mutate(across(.cols = everything(), as.character)) %>%
+  filter(antibiotic_history == "I have not taken antibiotics in the past year.") %>%
+  filter(diabetes == "I do not have this condition") %>%
+  select(-antibiotic_history, -diabetes) %>%
+  mutate(across(where(is.character), ~ str_replace_all(., "Unspecified", replacement = ""))) %>%
+  mutate(across(where(is.character), ~ str_replace_all(., "unknown", replacement = ""))) %>%
+  mutate(across(where(is.character), ~ str_replace_all(., "yes", replacement = "true"))) %>%
+  mutate(across(where(is.character), ~ str_replace_all(., "no", replacement = "false"))) %>%
+  mutate(across(where(is.character), ~ str_replace_all(., "Yes", replacement = "true"))) %>%
+  mutate(across(where(is.character), ~ str_replace_all(., "No", replacement = "false"))) %>%
+  mutate(across(where(is.character), ~ na_if(.,""))) 
+na_count <- sapply(relevant_features_1, function(x) sum(length(which(is.na(x)))))
+na_count <- names(na_count[na_count > 300])
+relevant_features_1 <- relevant_features_1 %>%
+select(-all_of(na_count)) %>%
+  na.omit() %>%
+  mutate(age_years = as.numeric(age_years))
+
+check_distinct_values <- relevant_features_1 %>% 
+  mutate(across(everything(), n_distinct))
+binary_names <- colnames(relevant_features_1)[which(check_distinct_values[1, ] == 2)]
+binary_names <- binary_names[binary_names != "sex"]
+
+food_levels <- c("frozen_dessert_frequency", "one_liter_of_water_a_day_frequency", 
+           "meat_eggs_frequency", "milk_substitute_frequency", "olive_oil",
+           "prepared_meals_frequency", "red_meat_frequency", "seafood_frequency",
+           "sugar_sweetened_drink_frequency",
+           "sugary_sweets_frequency", "whole_eggs", "whole_grain_frequency",
+           "fruit_frequency", "vegetable_frequency")
+normal_levels <- c("probiotic_frequency", "teethbrushing_frequency", 
+           "vitamin_b_supplement_frequency", "vitamin_d_supplement_frequency", 
+           "smoking_frequency", "exercise_frequency", "flossing_frequency"
+           )
+
+food_levels <- food_levels[!food_levels %in% na_count]
+normal_levels <- normal_levels[!normal_levels %in% na_count]
+
+relevant_features_2 <- relevant_features_1 %>%
+  mutate(bmi_cat = as.numeric(factor(bmi_cat, levels = levels_bmi)),
+         bmi_cat = ifelse(is.na(bmi_cat), 0, bmi_cat),
+         sleep_duration = as.numeric(factor(sleep_duration,
+                                     levels = levels_sleep)),
+         sex = as.numeric(sex == "female"),
+         last_travel = as.numeric(last_travel == "I have falset been outside of my country of residence in the past year.")
+        ) %>%
+  mutate(across(.cols = all_of(binary_names), ~ as.numeric(.x == "true"))) %>%
+  mutate(across(.cols = all_of(normal_levels), ~  as.numeric(factor(.x, levels = levels_str))))
+
+relevant_features <- relevant_features_2
+```
+
+Create subset of the original phyloseq object to analyze and root in bacteria
+
+
+```{r}
+subset_logical <- rownames(relevant_features)
+data_subset <- prune_samples(subset_logical, data)
+agp <- phyloseq(otu_table(data_subset),
+                        tax_table(data_subset),
+                        sample_data(relevant_features))
+agp <- subset_taxa(agp , Rank1 == "k__Bacteria")
+agp
+```
+
+
+## Data processing for predicitive performance
+
+Preprocessing for trac, creating the A matrix
+
+```{r}
+y <- (sample_data(agp)$age_years)
+tax <- agp@tax_table@.Data
+# add an OTU column
+tax <- cbind(tax, rownames(tax))
+colnames(tax)[ncol(tax)] <- "OTU"
+
+# make it so labels are unique
+for (i in seq(2, 7)) {
+  # add a number when the type is unknown... e.g. "g__"
+  ii <- nchar(tax[, i]) == 3
+  if (sum(ii) > 0)
+    tax[ii, i] <- paste0(tax[ii, i], 1:sum(ii))
+}
+# cumulative labels are harder to read but easier to work with:
+for (i in 2:8) {
+  tax[, i] <- paste(tax[, i-1], tax[, i], sep = "::")
+}
+tax <- as.data.frame(tax, stringsAsFactors = TRUE)
+
+# form phylo object:
+tree1 <- tax_table_to_phylo(~Rank1/Rank2/Rank3/Rank4/Rank5/Rank6/Rank7/OTU,
+                            data = tax, collapse = TRUE)
+
+# convert this to an A matrix to be used for aggregation:
+A <- phylo_to_A(tree1)
+
+dat <- list(y = y,
+            x = t(agp@otu_table@.Data),
+            tree = tree1,
+            tax = tax,
+            A = A,
+            sample_data = as_tibble(sample_data(agp)))
+```
+
+
+## Model fitting
+
+Create train test split and pseudo-count of 1
+
+### trac
+
+```{r}
+set.seed(123)
+additional_covariates <- data.frame(dat$sample_data) %>%
+  select(-age_years)
+```
+
+```{r}
+set.seed(123)
+log_pseudo <- function(x, pseudo_count = 1) log(x + pseudo_count)
+z <- log_pseudo(dat$x)
+
+y <- dat$y
+summary(y)
+
+ntot <- length(y)
+n <- round(0.8 * ntot)
+tr <- sample(ntot, n)
+
+# define training and test data
+ytr <- y[tr]
+yte <- y[-tr]
+
+ztr <- z[tr, ]
+zte <- z[-tr, ]
+additional_covariates_tr <- additional_covariates[tr, ]
+additional_covariates_te <- additional_covariates[-tr, ]
+w_add_cov <- rep(1, ncol(additional_covariates))
+```
+
+```{r}
+
+table(ytr)
+table(yte)
+
+```
+
+Fit model
+
+```{r}
+reticulate::py_run_string("import numpy as np; np.infty = np.inf")
+
+fit <- trac(ztr,
+            ytr, 
+            A = dat$A, 
+            additional_covariates = additional_covariates_tr, 
+            method = "regr", 
+            w_additional_covariates = w_add_cov,
+            normalized = FALSE)
+
+plot_trac_path <- function(fit, iw = 1, coef = c("alpha", "beta", "gamma")) {
+  coef <- match.arg(coef)
+  fit[[iw]][[coef]] %>% 
+    as.matrix() %>% 
+    t() %>%
+    tibble::as_tibble() %>% 
+    dplyr::mutate(frac = fit[[iw]]$fraclist) %>%
+    tidyr::pivot_longer(cols = -frac) %>% 
+    ggplot2::ggplot(ggplot2::aes(x = frac, y = value, 
+                                 group = name)) + 
+    ggplot2::geom_line(alpha = 0.2) + 
+    ggplot2::scale_x_log10() + 
+    ggplot2::theme(legend.position = "none") + 
+    ggplot2::labs(y = coef, x = "Fraction of lambda_max") +
+    theme_bw() +
+    ylab("Alpha")
+}
+
+fit_plot <- plot_trac_path(fit)
+fit_plot
+```
+
+
+```{r}
+w_add_cov_05 <- rep(0.5, ncol(additional_covariates))
+```
+
+
+### trac with less penalization
+
+```{r}
+fit_wo_pen <- trac(ztr, 
+            ytr, 
+            A = dat$A,
+            additional_covariates = additional_covariates_tr, 
+            method = "regr", 
+            w_additional_covariates = w_add_cov_05,
+            normalized = FALSE)
+
+
+fit_plot_wo_pen <- plot_trac_path(fit_wo_pen)
+fit_plot_wo_pen
+```
+
+### slc
+
+
+```{r}
+# fit slc 
+
+fit_slc <- sparse_log_contrast(ztr, 
+            ytr, 
+            additional_covariates = additional_covariates_tr, 
+            method = "regr", 
+            w_additional_covariates = w_add_cov,
+            normalized = FALSE)
+
+plot_slc_path <- function(fit, iw = 1, coef = c("beta")) {
+  coef <- match.arg(coef)
+  fit[[coef]] %>% 
+    as.matrix() %>% 
+    t() %>%
+    tibble::as_tibble() %>% 
+    dplyr::mutate(frac = fit$fraclist) %>%
+    tidyr::pivot_longer(cols = -.data$frac) %>% 
+    ggplot2::ggplot(ggplot2::aes(x = frac, y = value, 
+                                 group = name)) + 
+    ggplot2::geom_line(alpha = 0.2) + 
+    ggplot2::scale_x_log10() + 
+    ggplot2::theme(legend.position = "none") + 
+    ggplot2::labs(y = coef, x = "Fraction of lambda_max") +
+    theme_bw() +
+    ylab("beta")
+}
+
+fit_plot_slc <- plot_slc_path(fit_slc)
+fit_plot_slc
+```
+
+
+
+### slc with less penalization
+
+```{r}
+# fit slc 
+
+fit_slc_wo_pen <- sparse_log_contrast(ztr, 
+            ytr, 
+            additional_covariates = additional_covariates_tr, 
+            method = "regr", 
+            w_additional_covariates = w_add_cov_05,
+            normalized = FALSE)
+
+
+fit_plot_slc_wo_pen <- plot_slc_path(fit_slc_wo_pen)
+fit_plot_slc_wo_pen
+```
+
+
+### CV for hyperparameter tuning
+
+
+```{r}
+set.seed(123)
+folds <- ggb:::make_folds(n = length(ytr), nfolds = 5)
+cvfit <- cv_trac(fit, Z = ztr, y = ytr, A = dat$A, 
+                 additional_covariates = additional_covariates_tr,
+                 summary_function = base::mean,
+                 folds = folds)
+```
+
+
+```{r}
+cv_trac_plot <- data.frame(non_zero = cvfit$cv[[1]]$nonzeros,
+           error = cvfit$cv[[1]]$m,
+           se = cvfit$cv[[1]]$se) %>%
+  ggplot(aes(x = non_zero, y = error)) + 
+  geom_line(size = 1) +
+  geom_errorbar(aes(ymin = error - se, ymax = error + se), width = 20, size = 0.8,
+                color = "grey50") +
+  geom_point(size = 2.5, alpha = 1) +
+  geom_vline(xintercept = cvfit$cv[[1]]$nonzeros[cvfit$cv[[1]]$i1se], linetype = 2,
+             size = 0.8) +
+  geom_vline(xintercept = cvfit$cv[[1]]$nonzeros[cvfit$cv[[1]]$ibest], 
+             size = 0.8) +
+  theme_bw() +
+  xlab("Number of nonzero alpha") +
+  ylab("Cross-validation Error")
+
+  
+cv_trac_plot
+```
+
+
+```{r}
+set.seed(123)
+cvfit_wo_pen <- cv_trac(fit_wo_pen, Z = ztr, y = ytr, A = dat$A, 
+                 additional_covariates = additional_covariates_tr,
+                 summary_function = base::mean,
+                 folds = folds)
+
+```
+
+
+```{r}
+cv_trac_plot_wo_pen <- data.frame(non_zero = cvfit_wo_pen$cv[[1]]$nonzeros,
+           error = cvfit_wo_pen$cv[[1]]$m,
+           se = cvfit_wo_pen$cv[[1]]$se) %>%
+  ggplot(aes(x = non_zero, y = error)) + 
+  geom_line(size = 1) +
+  geom_errorbar(aes(ymin = error - se, ymax = error + se), width = 20, size = 0.8,
+                color = "grey50") +
+  geom_point(size = 2.5, alpha = 1) +
+  geom_vline(xintercept = cvfit_wo_pen$cv[[1]]$nonzeros[cvfit_wo_pen$cv[[1]]$i1se], linetype = 2,
+             size = 0.8) +
+  geom_vline(xintercept = cvfit_wo_pen$cv[[1]]$nonzeros[cvfit_wo_pen$cv[[1]]$ibest], 
+             size = 0.8) +
+  theme_bw() +
+  xlab("Number of nonzero alpha") +
+  ylab("Cross-validation Error") 
+
+  
+cv_trac_plot_wo_pen
+```
+
+```{r}
+set.seed(123)
+cvfit_slc <- cv_sparse_log_contrast(fit_slc, Z = ztr, y = ytr,
+                 additional_covariates = additional_covariates_tr,
+                 summary_function = base::mean,
+                 folds = folds)
+```
+
+
+
+```{r}
+cv_slc_plot <- data.frame(non_zero = cvfit_slc$cv$nonzeros,
+           error = cvfit_slc$cv$m,
+           se = cvfit_slc$cv$se) %>%
+  ggplot(aes(x = non_zero, y = error)) + 
+  geom_line(size = 1) +
+  geom_errorbar(aes(ymin = error - se, ymax = error + se), width = 20, size = 0.8,
+                color = "grey50") +
+  geom_point(size = 2.5, alpha = 1) +
+  geom_vline(xintercept = cvfit_slc$cv$nonzeros[cvfit_slc$cv$i1se], linetype = 2,
+             size = 0.8) +
+  geom_vline(xintercept = cvfit_slc$cv$nonzeros[cvfit_slc$cv$ibest], 
+             size = 0.8) +
+  theme_bw() +
+  xlab("Number of nonzero alpha") +
+  ylab("Cross-validation Error") 
+  
+cv_slc_plot
+```
+
+
+```{r}
+set.seed(123)
+cvfit_slc_wo_pen <- cv_sparse_log_contrast(fit_slc_wo_pen, Z = ztr, y = ytr,
+                 additional_covariates = additional_covariates_tr,
+                 summary_function = base::mean,
+                 folds = folds)
+```
+
+
+
+```{r}
+cv_slc_plot_wo_pen <- data.frame(non_zero = cvfit_slc_wo_pen$cv$nonzeros,
+           error = cvfit_slc_wo_pen$cv$m,
+           se = cvfit_slc_wo_pen$cv$se) %>%
+  ggplot(aes(x = non_zero, y = error)) + 
+  geom_line(size = 1) +
+  geom_errorbar(aes(ymin = error - se, ymax = error + se), width = 20, size = 0.8,
+                color = "grey50") +
+  geom_point(size = 2.5, alpha = 1) +
+  geom_vline(xintercept = cvfit_slc_wo_pen$cv$nonzeros[cvfit_slc_wo_pen$cv$i1se], linetype = 2,
+             size = 0.8) +
+  geom_vline(xintercept = cvfit_slc_wo_pen$cv$nonzeros[cvfit_slc_wo_pen$cv$ibest], 
+             size = 0.8) +
+  theme_bw() +
+  xlab("Number of nonzero alpha") +
+  ylab("Cross-validation Error")
+  
+cv_slc_plot_wo_pen
+```
+
+### Prediction and non-zero
+
+
+```{r}
+y_hat_trac <- predict_trac(fit = fit, new_Z = zte,
+             new_additional_covariates = additional_covariates_te)
+y_hat_trac_wo_pen <- predict_trac(fit = fit_wo_pen, new_Z = zte,
+             new_additional_covariates = additional_covariates_te)
+y_hat_slc <- predict_sparse_log_contrast(fit = fit_slc,
+                                  new_Z = zte,
+                                  new_additional_covariates =
+                                    additional_covariates_te)
+y_hat_slc_wo_pen <- predict_sparse_log_contrast(fit = fit_slc_wo_pen, 
+                                                new_Z = zte,
+                                                new_additional_covariates =
+                                                  additional_covariates_te)
+
+
+rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2))
+}
+
+# 1SE
+
+y_hat_trac_1SE <- y_hat_trac[[1]][, cvfit$cv[[1]]$i1se]
+y_hat_trac_wo_pen_1SE <- y_hat_trac_wo_pen[[1]][, cvfit_wo_pen$cv[[1]]$i1se]
+y_hat_slc_1SE <- y_hat_slc[, cvfit_slc$cv$i1se]
+y_hat_slc_wo_pen_1SE <- y_hat_slc_wo_pen[, cvfit_slc_wo_pen$cv$i1se]
+
+
+
+rmse_trac_1SE <- rmse(yte, y_hat_trac_1SE)
+rmse_trac_wo_pen_1SE <- rmse(yte, y_hat_trac_wo_pen_1SE)
+rmse_slc_1SE <- rmse(yte, y_hat_slc_1SE)
+rmse_slc_wo_pen_1SE <- rmse(yte, y_hat_slc_wo_pen_1SE)
+
+nz_1SE <- (fit[[1]]$alpha[, cvfit$cv[[1]]$i1se])
+nz_1SE <- nz_1SE[abs(nz_1SE) > 0]
+nz_n_1SE <- length(nz_1SE)
+
+nz_wo_pen_1SE <- (fit_wo_pen[[1]]$alpha[, cvfit_wo_pen$cv[[1]]$i1se])
+nz_wo_pen_1SE <- nz_wo_pen_1SE[abs(nz_wo_pen_1SE) > 0]
+nz_wo_pen_n_1SE <- length(nz_wo_pen_1SE)
+
+nz_slc_1SE <- (fit_slc$beta[, cvfit_slc$cv$i1se])
+nz_slc_1SE <- nz_slc_1SE[abs(nz_slc_1SE) > 0]
+nz_slc_n_1SE <- length(nz_slc_1SE)
+
+nz_slc_wo_pen_1SE <- (fit_slc_wo_pen$beta[, cvfit_slc_wo_pen$cv$i1se])
+nz_slc_wo_pen_1SE <- nz_slc_wo_pen_1SE[abs(nz_slc_wo_pen_1SE) > 0]
+nz_slc_wo_pen_n_1SE <- length(nz_slc_wo_pen_1SE)
+
+
+# Best
+
+y_hat_trac <- y_hat_trac[[1]][, cvfit$cv[[1]]$ibest]
+y_hat_trac_wo_pen <- y_hat_trac_wo_pen[[1]][, cvfit_wo_pen$cv[[1]]$ibest]
+y_hat_slc <- y_hat_slc[, cvfit_slc$cv$ibest]
+y_hat_slc_wo_pen <- y_hat_slc_wo_pen[, cvfit_slc_wo_pen$cv$ibest]
+
+rmse_trac <- rmse(yte, y_hat_trac)
+rmse_trac_wo_pen <- rmse(yte, y_hat_trac_wo_pen)
+rmse_slc <- rmse(yte, y_hat_slc)
+rmse_slc_wo_pen <- rmse(yte, y_hat_slc_wo_pen)
+
+nz <- (fit[[1]]$alpha[, cvfit$cv[[1]]$ibest])
+nz <- nz[abs(nz) > 0]
+nz_n <- length(nz)
+
+nz_wo_pen <- (fit_wo_pen[[1]]$alpha[, cvfit_wo_pen$cv[[1]]$ibest])
+nz_wo_pen <- nz_wo_pen[abs(nz_wo_pen) > 0]
+nz_wo_pen_n <- length(nz_wo_pen)
+
+nz_slc <- (fit_slc$beta[, cvfit_slc$cv$ibest])
+nz_slc <- nz_slc[abs(nz_slc) > 0]
+nz_slc_n <- length(nz_slc)
+
+nz_slc_wo_pen <- (fit_slc_wo_pen$beta[, cvfit_slc_wo_pen$cv$ibest])
+nz_slc_wo_pen <- nz_slc_wo_pen[abs(nz_slc_wo_pen) > 0]
+nz_slc_wo_pen_n <- length(nz_slc_wo_pen)
+
+```
+
+```{r}
+rmse_trac_1SE 
+rmse_trac_wo_pen_1SE
+rmse_slc_1SE 
+rmse_slc_wo_pen_1SE
+
+rmse_trac 
+rmse_trac_wo_pen
+rmse_slc 
+rmse_slc_wo_pen
+```
+
+
+```{r}
+
+# get n for compositional and non compositional selected features
+# trac based methods have :: in the names for compositional and
+# slc based methods have numbers for compositional features
+
+get_n_selected_compostional_non_compositional <- function(nz, trac = TRUE) {
+  if (is.null(names(nz))) {
+    c(comp = 0, non_comp = 0)
+  } else {
+    if(trac) {
+      distinct_comp_non_comp <- names(nz) %>% str_count(pattern = "::")
+      c(comp = sum(distinct_comp_non_comp >= 1), 
+           non_comp = sum(distinct_comp_non_comp == 0))
+    } else {
+      distinct_comp_non_comp <- names(nz) %>% str_detect(pattern = "[[:digit:]]")
+      c(comp = sum(distinct_comp_non_comp == TRUE), 
+           non_comp = sum(distinct_comp_non_comp == FALSE))
+    }
+  }
+}
+
+
+get_n_selected_compostional_non_compositional(nz)
+get_n_selected_compostional_non_compositional(nz_wo_pen)
+get_n_selected_compostional_non_compositional(nz_slc, trac = FALSE)
+get_n_selected_compostional_non_compositional(nz_slc_wo_pen, trac = FALSE)
+```
+
+```{r}
+
+# get n for compositional and non compositional selected features
+# trac based methods have :: in the names for compositional and
+# slc based methods have numbers for compositional features
+
+get_selected_non_compositional <- function(nz, trac = TRUE) {
+  if (is.null(names(nz))) {
+    NULL
+  } else {
+    if(trac) {
+      distinct_comp_non_comp <- names(nz) %>% str_count(pattern = "::")
+      names(nz)[distinct_comp_non_comp == 0]
+    } else {
+      distinct_comp_non_comp <- names(nz) %>% str_detect(pattern = "[[:digit:]]")
+           names(nz)[distinct_comp_non_comp == FALSE]
+    }
+  }
+}
+
+
+# get distinct taxa number by 1. splitting the log-ratios and counting the
+# distinct taxa
+get_distinct_taxa <- function(nz, trac = TRUE) {
+  nz %>%
+    enframe() %>%
+    separate(col = name, into = c("first", "second"), sep = "///") %>%
+    filter(!is.na(second)) %>%
+    pivot_longer(cols = c("first", "second"), values_to = "taxa") %>%
+    distinct(taxa) %>%
+    nrow()
+}
+```
+
+
+### Second Stage
+
+#### trac
+
+
+```{r}
+set.seed(123)
+get_selected_non_compositional(nz)
+two_stage <- second_stage(Z = ztr, A = dat$A, y = ytr, 
+                     additional_covariates = 
+                       additional_covariates_tr[
+                         , get_selected_non_compositional(nz), drop = FALSE],
+                     method = "regr", 
+                     betas = fit[[1]]$alpha[, cvfit$cv[[1]]$ibest],
+                     criterion = "1se", topk = 300, alpha = 0,
+                     nfolds = length(folds)  
+                     #, classo = FALSE,  w_additional = 1
+                     )
+nz_second <- two_stage$log_ratios[two_stage$log_ratios != 0]
+nz_second_n <- length(nz_second)
+
+y_hat <- predict_second_stage(fit = two_stage, new_Z = zte, 
+                              new_additional_covariates = 
+                                additional_covariates_te[ 
+                                  ,get_selected_non_compositional(nz),
+                                  drop = FALSE])
+rmse_second <- rmse(yte, y_hat)
+rmse_second
+```
+
+
+```{r}
+set.seed(123)
+get_selected_non_compositional(nz)
+two_stage_wo_pen <- second_stage(Z = ztr, A = dat$A, y = ytr, 
+                     additional_covariates = 
+                       additional_covariates_tr[
+                         , get_selected_non_compositional(nz), drop = FALSE],
+                     method = "regr", 
+                     betas = fit[[1]]$alpha[, cvfit$cv[[1]]$ibest],
+                     criterion = "1se", topk = 300, alpha = 0,
+                     #, w_additional = 0.5, 
+                     nfolds = length(folds)
+                     )
+
+nz_second_wo_pen <- two_stage_wo_pen$log_ratios[two_stage_wo_pen$log_ratios != 0]
+nz_second_wo_pen_n <- length(nz_second_wo_pen)
+
+y_hat_wo_pen <- predict_second_stage(fit = two_stage_wo_pen, new_Z = zte, 
+                              new_additional_covariates = 
+                                additional_covariates_te[ 
+                                  ,get_selected_non_compositional(nz), 
+                                  drop = FALSE])
+rmse_second_wo_pen <- rmse(yte, y_hat_wo_pen)
+rmse_second_wo_pen
+```
+
+
+#### trac wo pen
+
+
+```{r}
+
+set.seed(123)
+get_selected_non_compositional(nz_wo_pen)
+two_stage_wo_pen_normal <-
+  second_stage(Z = ztr, A = dat$A, y = ytr,
+               additional_covariates =
+                 additional_covariates_tr[ 
+                   , get_selected_non_compositional(nz_wo_pen), drop = FALSE],
+               method = "regr",
+               betas = fit_wo_pen[[1]]$alpha[, cvfit_wo_pen$cv[[1]]$ibest],
+               criterion = "1se", topk = 300, alpha = 0,# w_additional = 1, 
+               nfolds = length(folds)
+               )
+
+nz_second_wo_pen_normal <- two_stage_wo_pen_normal$log_ratios[two_stage_wo_pen_normal$log_ratios != 0]
+nz_second_wo_pen_normal_n <- length(nz_second_wo_pen_normal)
+nz_second_wo_pen_normal_n
+y_hat_wo_pen_normal <-
+  predict_second_stage(fit = two_stage_wo_pen_normal, new_Z = zte,
+                       new_additional_covariates =
+                         additional_covariates_te[ 
+                           , get_selected_non_compositional(nz_wo_pen), 
+                           drop = FALSE])
+rmse_second_wo_pen_normal <- rmse(yte, y_hat_wo_pen_normal)
+rmse_second_wo_pen_normal
+
+```
+
+
+```{r}
+
+set.seed(123)
+two_stage_wo_pen_wo_pen <- second_stage(Z = ztr, A = dat$A, y = ytr,
+                     additional_covariates =
+                       additional_covariates_tr[ 
+                         , get_selected_non_compositional(nz_wo_pen), 
+                         drop = FALSE],
+                     method = "regr",
+                     betas = fit_wo_pen[[1]]$alpha[, cvfit_wo_pen$cv[[1]]$ibest],
+                     criterion = "1se", alpha = 0, #w_additional = 0.5, 
+                     nfolds = length(folds)
+                     )
+nz_second_wo_pen_wo_pen <- two_stage_wo_pen_wo_pen$log_ratios[two_stage_wo_pen_wo_pen$log_ratios != 0]
+nz_second_wo_pen_wo_pen_n <- length(nz_second_wo_pen_wo_pen)
+
+y_hat_wo_pen_wo_penn <-
+  predict_second_stage(fit = two_stage_wo_pen_wo_pen, new_Z = zte,
+                       new_additional_covariates =
+                         additional_covariates_te[ ,
+                                                   get_selected_non_compositional(nz_wo_pen), drop = FALSE])
+rmse_second_wo_pen_wo_pen <- rmse(yte, y_hat_wo_pen_wo_penn)
+rmse_second_wo_pen_wo_pen
+
+```
+
+#### slc
+
+```{r}
+
+set.seed(123)
+two_stage_slc <- second_stage(Z = ztr, y = ytr, 
+                     additional_covariates = 
+                       additional_covariates_tr[
+                         , get_selected_non_compositional(nz_slc, trac = FALSE),
+                         drop = FALSE],
+                     method = "regr", 
+                     betas = fit_slc$beta[, cvfit_slc$cv$ibest],
+                     criterion = "1se", alpha = 0,
+                     nfolds = length(folds)#,  w_additional = 1
+                     )
+
+
+nz_second_slc <- two_stage_slc$log_ratios[two_stage_slc$log_ratios != 0]
+nz_second_slc_n <- length(nz_second_slc)
+
+y_hat_slc_two <- predict_second_stage(fit = two_stage_slc, new_Z = zte, 
+                              new_additional_covariates = 
+                                additional_covariates_te[ ,get_selected_non_compositional(nz_slc, trac = FALSE), 
+                                                     drop = FALSE])
+rmse_second_slc <- rmse(yte, y_hat_slc_two[, 1])
+rmse_second_slc
+
+```
+
+
+```{r}
+
+set.seed(123)
+two_stage_slc_wo_pen <- second_stage(Z = ztr, y = ytr, 
+                     additional_covariates = 
+                       additional_covariates_tr[ , get_selected_non_compositional(nz_slc, trac = FALSE), drop = FALSE],
+                     method = "regr", 
+                     betas = fit_slc$beta[, cvfit_slc$cv$ibest],
+                     criterion = "1se", alpha = 0, #w_additional = 0.5, 
+                     nfolds = length(folds)
+                     )
+
+nz_second_slc_wo_pen <- two_stage_slc_wo_pen$log_ratios[two_stage_slc_wo_pen$log_ratios != 0]
+nz_second_slc_wo_pen_n <- length(nz_second_slc_wo_pen)
+
+y_hat_slc_two_wo_pen <- predict_second_stage(fit = two_stage_slc_wo_pen, new_Z = zte, 
+                              new_additional_covariates = additional_covariates_te[ , get_selected_non_compositional(nz_slc, trac = FALSE), 
+                                                                                    drop = FALSE])
+rmse_second_slc_wo_pen <- rmse(yte, y_hat_slc_two_wo_pen[, 1])
+rmse_second_slc_wo_pen
+
+```
+
+
+#### slc wo pen
+
+
+```{r}
+
+set.seed(123)
+two_stage_slc_wo_pen_normal <-
+  second_stage(Z = ztr, y = ytr,
+               additional_covariates =
+                 additional_covariates_tr[ , get_selected_non_compositional(nz_slc_wo_pen, trac = FALSE), drop = FALSE],
+               method = "regr",
+               betas = fit_slc_wo_pen$beta[, cvfit_slc_wo_pen$cv$ibest],
+               criterion = "1se", alpha = 0,# w_additional = 1,
+                     nfolds = length(folds)
+                     )
+
+nz_second_slc_wo_pen_normal <- 
+  two_stage_slc_wo_pen_normal$log_ratios[two_stage_slc_wo_pen_normal$log_ratios != 0]
+nz_second_slc_wo_pen_normal_n <- length(nz_second_slc_wo_pen_normal)
+
+y_hat_slc_wo_pen_normal <-
+  predict_second_stage(fit = two_stage_slc_wo_pen_normal, new_Z = zte,
+                       new_additional_covariates =
+                         additional_covariates_te[ , get_selected_non_compositional(nz_slc_wo_pen, trac = FALSE), drop = FALSE])
+rmse_second_slc_wo_pen_normal <- rmse(yte, y_hat_slc_wo_pen_normal[, 1])
+rmse_second_slc_wo_pen_normal
+```
+
+
+```{r}
+
+set.seed(123)
+two_stage_slc_wo_pen_wo_pen <- second_stage(Z = ztr, y = ytr,
+                     additional_covariates =
+                       additional_covariates_tr[ , get_selected_non_compositional(nz_slc_wo_pen, trac = FALSE), drop = FALSE],
+                     method = "regr",
+                     betas = fit_slc_wo_pen$beta[, cvfit_slc_wo_pen$cv$ibest],
+                     criterion = "1se", topk = 300, alpha = 0, #w_additional = 0.5,
+                     nfolds = length(folds)
+                     )
+
+nz_second_slc_wo_pen_wo_pen <- 
+  two_stage_slc_wo_pen_wo_pen$log_ratios[two_stage_slc_wo_pen_wo_pen$log_ratios != 0]
+nz_second_slc_wo_pen_wo_pen_n <- length(nz_second_slc_wo_pen_wo_pen)
+
+y_hat_slc_wo_pen_wo_penn <-
+  predict_second_stage(fit = two_stage_slc_wo_pen_wo_pen, new_Z = zte,
+                       new_additional_covariates =
+                         additional_covariates_te[ ,
+                                                  get_selected_non_compositional(nz_slc_wo_pen, trac = FALSE), drop = FALSE])
+rmse_second_slc_wo_pen_wo_pen <- rmse(yte, y_hat_slc_wo_pen_wo_penn[, 1])
+rmse_second_slc_wo_pen_wo_pen
+```
+
+
+## Baseline Models: only Microbiome
+
+
+### trac
+
+```{r}
+fit_baseline <- trac(ztr,
+            ytr, 
+            A = dat$A, 
+            method = "regr")
+
+fit_plot_baseline <- plot_trac_path(fit_baseline)
+fit_plot_baseline
+```
+
+### slc
+
+```{r}
+fit_slc_baseline <- sparse_log_contrast(ztr, 
+            ytr, 
+            method = "regr")
+
+
+fit_plot_slc_baseline <- plot_slc_path(fit_slc_baseline)
+fit_plot_slc_baseline
+```
+
+### CV for hyperparameter
+
+```{r}
+set.seed(123)
+cvfit_baseline <- cv_trac(fit_baseline, Z = ztr, y = ytr, A = dat$A, 
+                 summary_function = base::mean,
+                 folds = folds)
+
+
+nz_baseline <- (fit_baseline[[1]]$alpha[, cvfit_baseline$cv[[1]]$ibest])
+nz_baseline <- nz_baseline[abs(nz_baseline) > 0]
+nz_baseline_n <- length(nz_baseline)
+
+y_hat_trac_baseline <- predict_trac(fit = fit_baseline, new_Z = zte)
+
+y_hat_trac_baseline <- y_hat_trac_baseline[[1]][, cvfit_baseline$cv[[1]]$ibest]
+
+rmse_trac_baseline <- rmse(yte, y_hat_trac_baseline)
+rmse_trac_baseline
+```
+
+
+
+```{r}
+set.seed(123)
+cvfit_slc_baseline <- cv_sparse_log_contrast(fit_slc_baseline, Z = ztr, y = ytr,
+                 summary_function = base::mean,
+                 folds = folds)
+
+
+nz_slc_baseline <- (fit_slc_baseline$beta[, cvfit_slc_baseline$cv$ibest])
+nz_slc_baseline <- nz_slc_baseline[abs(nz_slc_baseline) > 0]
+nz_slc_baseline_n <- length(nz_slc_baseline)
+
+
+y_hat_slc_baseline <- predict_sparse_log_contrast(fit = fit_slc_baseline,
+                                  new_Z = zte)
+y_hat_slc_baseline <- y_hat_slc_baseline[, cvfit_slc_baseline$cv$ibest]
+
+rmse_slc_baseline <- rmse(yte, y_hat_slc_baseline)
+rmse_slc_baseline
+```
+
+### Second Stage baseline
+
+#### trac
+
+```{r}
+set.seed(123)
+two_stage_baseline <- second_stage(Z = ztr, A = dat$A, y = ytr,
+                     method = "regr",
+                     betas = fit_baseline[[1]]$alpha[, cvfit_baseline$cv[[1]]$ibest],
+                     criterion = "1se", alpha = 0,
+                     nfolds = length(folds)
+                     )
+
+nz_second_baseline <- two_stage_baseline$log_ratios[two_stage_baseline$log_ratios != 0]
+nz_second_baseline_n <- length(nz_second_wo_pen_normal)
+
+y_hat_baseline <- predict_second_stage(fit = two_stage_baseline, new_Z = zte)
+rmse_second_baseline <- rmse(yte, y_hat_baseline)
+rmse_second_baseline
+```
+
+#### SLC
+
+```{r}
+set.seed(123)
+two_stage_slc_baseline <- second_stage(Z = ztr, y = ytr, 
+                     method = "regr", 
+                     betas = fit_slc_baseline$beta[, cvfit_slc_baseline$cv$ibest],
+                     criterion = "1se", alpha = 0,
+                     nfolds = length(folds)
+                     )
+
+nz_second_slc_baseline <- two_stage_slc_baseline$log_ratios[two_stage_slc_baseline$log_ratios != 0]
+nz_second_slc_baseline_n <- length(nz_second_slc_baseline)
+
+y_hat_slc_two_baseline <- predict_second_stage(fit = two_stage_slc_baseline, new_Z = zte)
+
+rmse_second_slc_baseline <- rmse(yte, y_hat_slc_two_baseline)
+rmse_second_slc_baseline
+```
+
+
+## Baseline Models: only non-compositional
+
+
+```{r}
+non_comp <- cbind(ytr, additional_covariates_tr)
+fit_lm <- glm(ytr ~ ., data = non_comp, family = "gaussian")
+y_hat_lm <- predict(fit_lm, newdata = additional_covariates_te)
+
+n_lm <- ncol(additional_covariates_tr)
+rmse_lm <- rmse(yte, y_hat_lm)
+rmse_lm
+```
+
+```{r}
+set.seed(123)
+fit_sparse <- glmnet::cv.glmnet(as.matrix(additional_covariates_tr), ytr,
+                                family = "gaussian",
+                                nfolds = 5,  type.measure = "mse",
+                                alpha = 1)
+y_hat_sparse <- predict(fit_sparse, newx = as.matrix(additional_covariates_te))
+nz_sparse <- as.matrix(coef(fit_sparse))[-1, ]
+nz_sparse <- nz_sparse[nz_sparse != 0]
+n_sparse <- sum(as.matrix(coef(fit_sparse)) != 0) - 1
+rmse_sparse <- rmse(yte, y_hat_sparse)
+rmse_sparse
+```
+
+## Calculate Pearson
+
+### Pearson
+
+```{r}
+cor_logistic <- cor(y_hat_lm, yte)
+cor_lasso <- cor(y_hat_sparse, yte)
+
+cor_slc_baseline <- cor(y_hat_slc_baseline, yte)
+cor_trac_baseline <- cor(y_hat_trac_baseline, yte)
+cor_second_baseline <- cor(y_hat_baseline, yte)
+cor_second_slc_baseline <- cor(y_hat_slc_two_baseline, yte)
+
+cor_trac <- cor(y_hat_trac, yte)
+cor_trac_wo_pen <- cor(y_hat_trac_wo_pen, yte)
+cor_slc <- cor(y_hat_slc, yte)
+cor_slc_wo_pen <- cor(y_hat_slc_wo_pen, yte)
+
+cor_second_normal_normal <- cor(y_hat, yte)
+cor_second_normal_wo_pen <- cor(y_hat_wo_pen, yte)
+cor_second_wo_pen_normal <- cor(y_hat_wo_pen_normal, yte)
+cor_second_wo_pen_wo_pen <- cor(y_hat_wo_pen_wo_penn, yte)
+
+cor_slc_second_normal_normal <- cor(y_hat_slc_two, yte)
+cor_slc_second_normal_wo_pen <- cor(y_hat_slc_two_wo_pen, yte)
+cor_slc_second_wo_pen_normal <- cor(y_hat_slc_wo_pen_normal, yte)
+cor_slc_second_wo_pen_wo_pen <- cor(y_hat_slc_wo_pen_wo_penn, yte)
+```
+
+
+```{r}
+# Get predictions and actual values
+predictions <- y_hat_wo_pen_normal
+actual <- yte
+
+# Calculate regression metrics
+results <- data.frame(
+  RMSE = sqrt(mean((actual - predictions)^2)),
+  MAE = mean(abs(actual - predictions)),
+  R_squared = cor(actual, predictions)^2,
+  Pearson_cor = cor(actual, predictions)
+)
+print(results)
+```
+```{r}
+caret::postResample(pred = y_hat_wo_pen_normal, obs = yte)
+```
+
+## Save models
+
+```{r}
+models_list <- list(lm_baseline = fit_lm,
+                    lasso_baseline = fit_sparse,
+                    slc_baseline = list(fit_slc_baseline, cvfit_slc_baseline),
+                    slc_baseline_second = two_stage_slc_baseline,
+                    trac_baseline  = list(fit_baseline, cvfit_baseline),
+                    trac_baseline_second = two_stage_baseline,
+                    slc = list(fit_slc, cvfit_slc),
+                    slc_wo_pen = list(fit_slc_wo_pen, cvfit_slc_wo_pen),
+                    trac = list(fit, cvfit),
+                    trac_wo_pen = list(fit_wo_pen, cvfit_wo_pen),
+                    slc_second = two_stage_slc,
+                    slc_second_wo_pen = two_stage_slc_wo_pen,
+                    slc_wo_pen_second = two_stage_slc_wo_pen_normal,
+                    slc_wo_pen_second_wo_pen = two_stage_slc_wo_pen_wo_pen,
+                    trac_second = two_stage,
+                    trac_second_wo_pen = two_stage_wo_pen,
+                    trac_wo_pen_second = two_stage_wo_pen_normal,
+                    trac_wo_pen_second_wo_pen = two_stage_wo_pen_wo_pen)
+saveRDS(models_list, file = "../AGP_age/models/models.RDS")
+```
+
+
+
+## Create figures and tables
+
+### tables
+
+
+```{r}
+df_summary <- data.frame(
+  Method = c("Logistic \n Regression", "Sparse \n Logistic \n Regression", "SLC", "SLC + \n second stage",
+             "trac", "trac + \n second stage", "SLC", "SLC",
+             "trac", "trac", rep("SLC + \n second stage", 4),
+             rep("trac + \n second stage", 4)),
+  Microbiome = c(rep("-", 2), rep("+", 16)),
+  Meta = c(rep("+", 2), rep("-", 4), rep("+", 12)),
+  Stage_I = c(rep("-", 6), rep(c(1, 0.5), 2), rep(c(1, 1, 0.5, 0.5), 2)),
+  Stage_II = c(rep("-", 10), rep(c(1, 0.5), 4)),
+  c_compositional = c("-",
+               "-",
+               nz_slc_baseline_n,
+               get_distinct_taxa(nz_second_slc_baseline),
+               nz_baseline_n,
+               get_distinct_taxa(nz_second_baseline),
+               get_n_selected_compostional_non_compositional(nz_slc, trac = FALSE)[1],
+               get_n_selected_compostional_non_compositional(nz_slc_wo_pen, trac = FALSE)[1],
+               get_n_selected_compostional_non_compositional(nz)[1],
+               get_n_selected_compostional_non_compositional(nz_wo_pen)[1],
+               get_distinct_taxa(nz_second_slc)[1],
+               get_distinct_taxa(nz_second_slc_wo_pen)[1],
+               get_distinct_taxa(nz_second_slc_wo_pen_normal)[1],
+               get_distinct_taxa(nz_second_slc_wo_pen_wo_pen)[1],
+               get_distinct_taxa(nz_second)[1],
+               get_distinct_taxa(nz_second_wo_pen)[1],
+               get_distinct_taxa(nz_second_wo_pen_normal)[1],
+               get_distinct_taxa(nz_second_wo_pen_wo_pen)[1]),
+  c_non_compositional = c(n_lm,
+                          n_sparse,
+                          "-",
+                          "-",
+                          "-",
+                          "-",
+               get_n_selected_compostional_non_compositional(nz_slc, trac = FALSE)[2],
+               get_n_selected_compostional_non_compositional(nz_slc_wo_pen, trac = FALSE)[2],
+               get_n_selected_compostional_non_compositional(nz)[2],
+               get_n_selected_compostional_non_compositional(nz_wo_pen)[2],
+               get_n_selected_compostional_non_compositional(nz_second_slc, trac = FALSE)[2],
+               get_n_selected_compostional_non_compositional(nz_second_slc_wo_pen, trac = FALSE)[2],
+               get_n_selected_compostional_non_compositional(nz_second_slc_wo_pen_normal, trac = FALSE)[2],
+               get_n_selected_compostional_non_compositional(nz_second_slc_wo_pen_wo_pen, trac = FALSE)[2],
+               get_n_selected_compostional_non_compositional(nz_second)[2],
+               get_n_selected_compostional_non_compositional(nz_second_wo_pen)[2],
+               get_n_selected_compostional_non_compositional(nz_second_wo_pen_normal)[2],
+               get_n_selected_compostional_non_compositional(nz_second_wo_pen_wo_pen)[2]),
+  c_log_ratio = c(rep("-", 3),
+                  nz_second_slc_baseline_n,
+                  "-",
+                  nz_second_baseline_n,
+                  rep("-", 4),
+                  get_n_selected_compostional_non_compositional(nz_second_slc, trac = FALSE)[1],
+               get_n_selected_compostional_non_compositional(nz_second_slc_wo_pen, trac = FALSE)[1],
+               get_n_selected_compostional_non_compositional(nz_second_slc_wo_pen_normal, trac = FALSE)[1],
+               get_n_selected_compostional_non_compositional(nz_second_slc_wo_pen_wo_pen, trac = FALSE)[1],
+               get_n_selected_compostional_non_compositional(nz_second)[1],
+               get_n_selected_compostional_non_compositional(nz_second_wo_pen)[1],
+               get_n_selected_compostional_non_compositional(nz_second_wo_pen_normal)[1],
+               get_n_selected_compostional_non_compositional(nz_second_wo_pen_wo_pen)[1]),
+  RMSE = c(rmse_lm,
+          rmse_sparse,
+          rmse_slc_baseline,
+          rmse_second_slc_baseline,
+          rmse_trac_baseline,
+          rmse_second_baseline,
+          rmse_slc,
+          rmse_slc_wo_pen,
+          rmse_trac,
+          rmse_trac_wo_pen,
+          rmse_second_slc,
+          rmse_second_slc_wo_pen,
+          rmse_second_slc_wo_pen_normal,
+          rmse_second_slc_wo_pen_wo_pen,
+          rmse_second,
+          rmse_second_wo_pen,
+          rmse_second_wo_pen_normal,
+          rmse_second_wo_pen_wo_pen),
+    Pearson = c(cor_logistic,
+          cor_lasso,
+          cor_slc_baseline,
+          cor_second_slc_baseline,
+          cor_trac_baseline,
+          cor_second_baseline,
+          cor_slc,
+          cor_slc_wo_pen,
+          cor_trac,
+          cor_trac_wo_pen,
+          cor_slc_second_normal_normal,
+          cor_slc_second_normal_wo_pen,
+          cor_slc_second_wo_pen_normal,
+          cor_slc_second_wo_pen_wo_pen,
+          cor_second_normal_normal,
+          cor_second_normal_wo_pen,
+          cor_second_wo_pen_normal,
+          cor_second_wo_pen_wo_pen)
+  ) %>%
+  mutate(RMSE = round(RMSE, 3),
+         Pearson = round(Pearson, 3))
+
+df_summary 
+
+df_summary %>%
+  mutate(Method = linebreak(Method, align = "l")) %>%
+  kbl("latex", digits = c(rep(1,4), rep(3,6)), 
+      col.names = c("Model","Bacteria","Meta", "Stage I", "Stage II", "Taxa", "Meta", "Log-ratio", "AUC", "MCC"), booktabs = TRUE,
+      align = c("l", rep("c", 8)), escape = FALSE) %>%
+     add_header_above(c(" " = 1, "Data type" = 2, "Meta weight" = 2, "# selected" = 3)) %>%
+  save_kable(
+    "../AGP_age/results/summary_models.tex") 
+```
+
+
+
+
+
+### Figures
+
+```{r}
+trac_coeff_plot <- nz_second_wo_pen_wo_pen %>% enframe() %>%
+  mutate(name = str_replace_all(name, "'", "")) %>%
+  mutate(non_comp = case_when(str_starts(name, "k__") ~ 1,
+                              TRUE ~ 0)) %>%
+  group_by(non_comp) %>%
+  slice_max(order_by = abs(value), n = 5) %>%
+  ungroup() %>%
+  mutate(name = str_replace(name, "k__Bacteria::", ""),
+           name = str_replace(name, "Bacteria::", ""),
+           name = str_remove_all(name, "[a-z]__"),
+           name = str_replace(name, "sex", "female"),
+           name = str_replace_all(name, "_", " "),
+           name = str_replace_all(name, "///", "\n")) %>%
+  arrange(value) %>%
+  mutate(name = factor(name, name)) %>%
+  ggplot(aes(x = value, y = name)) +
+  geom_point(size = 2) +
+  geom_segment(aes(x = 0, xend = value, y = name, yend = name)) +
+  xlab("Coefficients") +
+  ylab("") +
+  theme_bw() +
+  theme(axis.text.y = element_text(size = rel(0.8)))
+ggsave(filename = "../AGP_age/results/agp_coeff_trac.png", plot = trac_coeff_plot)
+```
+
+
+```{r}
+OTU_name <- enframe(as.character(tax$OTU)) %>%
+  separate(value, sep = "::", into = c("Kingdom", "Phylum", "Class",
+                                       "Order", "Family", "Genus",
+                                       "Species", "OTU"),
+           remove = FALSE) %>%
+  mutate(name = OTU) %>%
+  select(name, value) %>%
+  rename(names = value)
+
+OTU_slc_second <- nz_second_slc_wo_pen_normal %>% 
+  enframe() %>%
+  separate(col = name, into = c("first", "second"), sep = "///") %>%
+  filter(!is.na(second)) %>%
+  rename(name = first) %>%
+  left_join(OTU_name, by = "name") %>%
+  rename(first = name,
+         name = second,
+         names_first = names) %>%
+  left_join(OTU_name, by = "name") %>%
+  rename(second = name,
+         names_second = names) %>%
+  mutate(name = paste0(first, "///", second),
+         names = paste0(names_first, "///", names_second)) %>%
+  select(name, names)
+
+
+slc_coeff_plot <- nz_second_slc_wo_pen_normal %>% enframe() %>%
+  left_join(OTU_slc_second, by = "name") %>%
+  mutate(names = case_when(is.na(names) ~ name,
+                           TRUE ~ names)) %>%
+    mutate(name = str_replace_all(names, "'", ""),
+           name = str_replace(name, "k__Bacteria::", ""),
+           name = str_remove_all(name, "[a-z]__"),
+           name = str_replace(name, "sex", "female"),
+           name = str_replace_all(name, "_", " "),
+           name = str_replace_all(name, "///", "\n")) %>%
+  arrange(value) %>%
+  mutate(name = factor(name, name)) %>%
+  ggplot(aes(x = value, y = name)) +
+  geom_point(size = 2) +
+  geom_segment(aes(x = 0, xend = value, y = name, yend = name)) +
+  xlab("Coefficients") +
+  ylab("") +
+  theme_bw() +
+  theme(axis.text.y = element_text(size = rel(0.8)))
+ggsave(filename = "../AGP_age/results/agp_coeff_slc.png", plot = slc_coeff_plot)
+```
+
+
+```{r}
+# check which of the non-compositional covaritates have been selected by all
+# methods
+
+# get logical vector if the non zero features are non-compositional for plotting
+# the intersect between the different methods
+get_non_compositional_trac <- function(nz) {
+  distinct_comp_non_comp <- names(nz) %>% str_count(pattern = "::")
+  distinct_comp_non_comp == 0
+}
+
+get_non_compositional_slc <- function(nz) {
+  distinct_comp_non_comp <- names(nz) %>% str_detect(pattern = "[[:digit:]]")
+  distinct_comp_non_comp != TRUE
+}
+
+
+non_comp_trac <- names(nz[get_non_compositional_trac(nz)])
+names(non_comp_trac) <- rep("trac (w = 1)", length(non_comp_trac))
+
+non_comp_trac_wo_pen <- names(nz_wo_pen[get_non_compositional_trac(nz_wo_pen)])
+names(non_comp_trac_wo_pen) <- rep("trac (w = 0.5)", length(non_comp_trac_wo_pen))
+
+non_comp_slc <- names(nz_slc[get_non_compositional_slc(nz_slc)])
+names(non_comp_slc) <- rep("slc (w = 1)", length(non_comp_slc))
+
+non_comp_slc_wp_pen <- names(nz_slc_wo_pen[get_non_compositional_slc(nz_slc_wo_pen)])
+names(non_comp_slc_wp_pen) <- rep("slc (w = 0.5)", length(non_comp_slc_wp_pen))
+
+lasso_selected <- names(nz_sparse)
+names(lasso_selected) <- rep("lasso", length(lasso_selected))
+
+
+
+non_comp_trac_second <- names(nz_second[get_non_compositional_trac(nz_second)])
+names(non_comp_trac_second) <- rep("trac (w = 1) + second (w = 1)", length(non_comp_trac_second))
+
+non_comp_trac_second_wo_pen <- names(nz_second_wo_pen[get_non_compositional_trac(nz_second_wo_pen)])
+names(non_comp_trac_second_wo_pen) <- rep("trac (w = 1) + second (w = 0.5)", length(non_comp_trac_second_wo_pen))
+
+non_comp_trac_second_wo_pen_normal <- names(nz_second_wo_pen_normal[get_non_compositional_trac(nz_second_wo_pen_normal)])
+names(non_comp_trac_second_wo_pen_normal) <- rep("trac (w = 0.5) + second (w = 1)", length(non_comp_trac_second_wo_pen_normal))
+
+non_comp_trac_second_wo_pen_wo_pen <- names(nz_second_wo_pen_wo_pen[get_non_compositional_trac(nz_second_wo_pen_wo_pen)])
+names(non_comp_trac_second_wo_pen_wo_pen) <- rep("trac (w = 0.5) + second (w = 0.5)", length(non_comp_trac_second_wo_pen_wo_pen))
+
+
+non_comp_slc_second <- names(nz_second_slc[get_non_compositional_slc(nz_second_slc)])
+names(non_comp_slc_second) <- rep("slc (w = 1) + second (w = 1)", length(non_comp_slc_second))
+
+non_comp_slc_second_wo_pen <- names(nz_second_slc_wo_pen[get_non_compositional_slc(nz_second_slc_wo_pen)])
+names(non_comp_slc_second_wo_pen) <- rep("slc (w = 1) + second (w = 0.5)", length(non_comp_slc_second_wo_pen))
+
+non_comp_slc_second_wo_pen_normal <- names(nz_second_slc_wo_pen_normal[get_non_compositional_slc(nz_second_slc_wo_pen_normal)])
+names(non_comp_slc_second_wo_pen_normal) <- rep("slc (w = 0.5) + second (w = 1)", length(non_comp_slc_second_wo_pen_normal))
+
+non_comp_slc_second_wo_pen_wo_pen <- names(nz_second_slc_wo_pen_wo_pen[get_non_compositional_slc(nz_second_slc_wo_pen_wo_pen)])
+names(non_comp_slc_second_wo_pen_wo_pen) <- rep("slc (w = 0.5), second (w = 0.5)", length(non_comp_slc_second_wo_pen_wo_pen))
+
+df_joint_selected <- bind_rows(enframe(non_comp_trac),
+          enframe(non_comp_trac_wo_pen),
+          enframe(non_comp_slc),
+          enframe(non_comp_slc_wp_pen),
+          enframe(lasso_selected),
+          enframe(non_comp_trac_second),
+           enframe(non_comp_trac_second_wo_pen),
+           enframe(non_comp_trac_second_wo_pen_normal),
+           enframe(non_comp_trac_second_wo_pen_wo_pen),
+           enframe(non_comp_slc_second),
+          enframe(non_comp_slc_second_wo_pen),
+           enframe(non_comp_slc_second_wo_pen_normal),
+           enframe(non_comp_slc_second_wo_pen_wo_pen)) %>%
+  mutate(val = 1) 
+
+p_non_comp <- df_joint_selected %>%
+  expand(name, value) %>%
+  left_join(df_joint_selected, by = c("name", "value")) %>%
+  mutate(val = replace_na(val, 0)) %>%
+  mutate(val = factor(val, levels = c(1, 0),
+                      labels = c("Yes", "No"))) %>%
+  mutate(value = str_replace_all(value, "allergic_to_i_have_no_food_allergies_that_i_know_of", "no_food_allergies")) %>%
+  mutate(name = str_replace_all(name, "_", " ")) %>%
+  mutate(value = str_replace_all(value, "_", " ")) %>%
+  mutate(value = str_replace_all(value, "sex", "female")) %>%
+  ggplot(aes(name, value, fill= val)) + 
+  geom_tile(colour = "gray50") +
+  scale_fill_manual(values = c("black", "white")) +
+  coord_equal(expand = 0) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab("") +
+  ylab("") + 
+  guides(fill = guide_legend(title = "Selected?"))
+
+ggsave(filename = "../AGP_age/results/non_comp_selected.png", plot = p_non_comp)
+p_non_comp
+```
+
+```{r}
+tax_level <- c("Phylum", "Class", "Order", "Family", "Genus",
+  "Species", "OTU")
+tax_levels <- factor(tax_level, level = tax_level)
+
+comp_trac <- names(nz[!get_non_compositional_trac(nz)]) %>%
+  str_replace(., "'", "") %>%
+  str_count(., "::") %>%
+  {table(tax_levels[.])}
+
+comp_trac_wo_pen <- names(nz_wo_pen[!get_non_compositional_trac(nz_wo_pen)]) %>%
+  str_replace(., "'", "") %>%
+  str_count(., "::") %>%
+  {table(tax_levels[.])}
+
+comp_trac_baseline <- names(nz_baseline[!get_non_compositional_trac(nz_baseline)]) %>%
+  str_replace(., "'", "") %>%
+  str_count(., "::") %>%
+  {table(tax_levels[.])}
+
+comp_slc <- names(nz_slc[!get_non_compositional_slc(nz_slc)]) %>%
+  str_count(., "::") %>%
+  {table(tax_levels[. + 7])}
+comp_slc_wo_pen <- names(nz_slc_wo_pen[!get_non_compositional_slc(nz_slc_wo_pen)])  %>%
+  str_count(., "::") %>%
+  {table(tax_levels[. + 7])}
+comp_slc_baseline <- names(nz_slc_baseline[!get_non_compositional_slc(nz_slc_baseline)]) %>%
+  str_count(., "::") %>%
+  {table(tax_levels[. + 7])}
+
+
+tax_df <- bind_rows(comp_trac,
+                    comp_trac_wo_pen,
+                    comp_trac_baseline,
+                    comp_slc,
+                    comp_slc_wo_pen,
+                    comp_slc_baseline) %>%
+  as_tibble() %>%
+  as.data.frame()
+
+tax_df <- tibble(Method = c("trac", "trac (w = 0.5)", "trac only microbiome",
+                            "slc", "slc (w = 0.5)", "slc only microbiome")) %>%
+  bind_cols(., tax_df) %>%
+  bind_cols(., tibble(Meta = c(length(non_comp_trac),
+                               length(non_comp_trac_wo_pen),
+                               0,
+                               length(non_comp_slc),
+                               length(non_comp_slc_wp_pen),
+                               0)))
+
+
+tax_df %>%
+  kbl("latex") %>%
+  save_kable(
+    "../AGP_age/results/summary_selected_levels.tex") 
+tax_df
+```
+
+## Tables selected log-ratios
+
+### trac
+
+```{r}
+enframe(nz_second) %>%
+  arrange(desc(abs(value))) %>%
+  slice_head(n = 10) %>%
+  kbl("latex") %>%
+  save_kable(
+    "../AGP_age/results/trac_two_normal_normal.tex") 
+
+# Second Stage trac normal normal
+kbl(enframe(nz_second) %>%
+  arrange(desc(abs(value))))
+```
+```{r}
+# Second Stage trac normal less penalization
+enframe(nz_second_wo_pen) %>%
+  arrange(desc(abs(value))) %>%
+  slice_head(n = 10) %>%
+  kbl("latex") %>%
+  save_kable(
+    "../AGP_age/results/trac_two_normal_wo_pen.tex") 
+
+kbl(enframe(nz_second_wo_pen) %>%
+  arrange(desc(abs(value))))
+```
+
+
+```{r}
+# Second Stage trac less penalization normal
+enframe(nz_second_wo_pen_normal) %>%
+  arrange(desc(abs(value))) %>%
+  slice_head(n = 10) %>%
+  kbl("latex") %>%
+  save_kable(
+    "../AGP_age/results/trac_two_wo_pen_normal.tex") 
+
+kbl(enframe(nz_second_wo_pen_normal) %>%
+  arrange(desc(abs(value))))
+```
+
+```{r}
+# Second Stage trac less less penalization
+enframe(nz_second_wo_pen_wo_pen) %>%
+  arrange(desc(abs(value))) %>%
+  slice_head(n = 10) %>%
+  kbl("latex") %>%
+  save_kable(
+    "../AGP_age/results/trac_two_wo_pen_wo_pen.tex") 
+
+kbl(enframe(nz_second_wo_pen_wo_pen) %>%
+  arrange(desc(abs(value))))
+```
+
+### SLC
+
+```{r}
+enframe(nz_second_slc) %>%
+  arrange(desc(abs(value))) %>%
+  slice_head(n = 10) %>%
+  kbl("latex") %>%
+  save_kable(
+    "../AGP_age/results/slc_two_normal_normal.tex") 
+
+# Second Stage trac normal normal
+kbl(enframe(nz_second_slc) %>%
+  arrange(desc(abs(value))))
+```
+
+```{r}
+# Second Stage trac normal less penalization
+enframe(nz_second_slc_wo_pen) %>%
+  arrange(desc(abs(value))) %>%
+  slice_head(n = 10) %>%
+  kbl("latex") %>%
+  save_kable(
+    "../AGP_age/results/slc_two_normal_wo_pen.tex") 
+
+kbl(enframe(nz_second_slc_wo_pen) %>%
+  arrange(desc(abs(value))))
+```
+
+
+```{r}
+# Second Stage trac less penalization normal
+enframe(nz_second_slc_wo_pen_normal) %>%
+  arrange(desc(abs(value))) %>%
+  slice_head(n = 10) %>%
+  kbl("latex") %>%
+  save_kable(
+    "../AGP_age/results/slc_two_wo_pen_normal.tex") 
+
+kbl(enframe(nz_second_slc_wo_pen_normal) %>%
+  arrange(desc(abs(value))))
+```
+
+```{r}
+# Second Stage trac less less penalization
+enframe(nz_second_slc_wo_pen_wo_pen) %>%
+  arrange(desc(abs(value))) %>%
+  slice_head(n = 10) %>%
+  kbl("latex") %>%
+  save_kable(
+    "../AGP_age/results/slc_two_wo_pen_wo_pen.tex") 
+
+kbl(enframe(nz_second_slc_wo_pen_wo_pen) %>%
+  arrange(desc(abs(value))))
+```
+
+### Baseline
+
+```{r}
+# Second Stage trac baseline
+enframe(nz_second_baseline) %>%
+  arrange(desc(abs(value))) %>%
+  slice_head(n = 10) %>%
+  kbl("latex") %>%
+  save_kable(
+    "../AGP_age/results/trac_two_baseline.tex") 
+
+kbl(enframe(nz_second_baseline) %>%
+  arrange(desc(abs(value))))
+```
+
+
+```{r}
+# Second Stage slc baseline
+enframe(nz_second_slc_baseline) %>%
+  arrange(desc(abs(value))) %>%
+  slice_head(n = 10) %>%
+  kbl("latex") %>%
+  save_kable(
+    "../AGP_age/results/slc_two_baseline.tex") 
+
+kbl(enframe(nz_second_slc_baseline) %>%
+  arrange(desc(abs(value))))
+```
+
